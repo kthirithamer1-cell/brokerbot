@@ -1,0 +1,83 @@
+# ============================================
+# IBKR AI Trading Bot — Configuration
+# ============================================
+
+# --- IBKR Connection ---
+ibkr:
+  host: "127.0.0.1"
+  port: 7497          # 7497 = TWS Paper, 7496 = TWS Live, 4002 = Gateway Paper, 4001 = Gateway Live
+  client_id: 1
+  account: ""         # Leave empty to auto-detect
+
+# --- Watchlist ---
+watchlist:
+  symbols:
+    - SPY
+    - AAPL
+    - MSFT
+    - NVDA
+    - TSLA
+    - AMD
+    - META
+    - GOOGL
+    - AMZN
+
+# --- Penny Stock Scanner ---
+penny_scanner:
+  enabled: true
+  min_price: 0.50
+  max_price: 10.00
+  min_avg_volume: 500000
+  min_market_cap: 10_000_000    # $10M
+  max_market_cap: 500_000_000   # $500M
+  exchanges:
+    - NYSE
+    - NASDAQ
+    - AMEX
+  top_n_picks: 10
+  # Scoring weights (must sum to 1.0)
+  weights:
+    volume_surge: 0.25
+    momentum: 0.20
+    technical: 0.20
+    sentiment: 0.20
+    relative_strength: 0.15
+
+# --- Strategy / ML ---
+strategy:
+  timeframe: "1d"              # 1d, 1h, 15m, 5m
+  lookback_years: 5            # How many years of historical data for training
+  label_horizon_days: 5        # Forward-looking period for labeling
+  label_threshold_pct: 1.5     # % move threshold for BUY/SELL labels
+  confidence_threshold: 0.40   # Increased from 0.60 to only enter high-conviction trades
+  model_type: "xgboost"        # xgboost or lightgbm
+  retrain_interval_days: 30    # Re-train model every N days
+
+# --- Risk Management ---
+risk:
+  max_risk_per_trade_pct: 1.5  # Max % of account equity risked per trade
+  max_position_pct: 5.0        # Max % of portfolio in one position
+  max_daily_loss_pct: 3.0      # Daily drawdown kill-switch (% of account)
+  max_open_positions: 10       # Maximum simultaneous positions
+  stop_loss_atr_mult: 5      # Gives penny stocks room to avoid noise
+  take_profit_atr_mult: 4.5    # Targets large breakout moves
+  trailing_stop_pct: 2.0       # Trailing stop as % below high watermark
+
+# --- Sentiment / News ---
+sentiment:
+  provider: "newsapi"          # newsapi or scraper
+  model: "ProsusAI/finbert"    # HuggingFace model for sentiment
+  lookback_days: 7             # How many days of news to fetch
+  min_articles: 2              # Minimum articles required for a valid sentiment score
+
+# --- Backtesting ---
+backtest:
+  initial_capital: 100000.0
+  commission_per_share: 0.005  # IBKR tiered rate
+  slippage_pct: 0.05           # 5 basis points slippage estimate
+
+# --- Logging ---
+logging:
+  level: "INFO"
+  trade_log_file: "logs/trades.csv"
+  report_dir: "reports/"

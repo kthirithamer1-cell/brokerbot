@@ -1,0 +1,24 @@
+{
+  "total_trades": 13,
+  "winning_trades": 7,
+  "losing_trades": 6,
+  "win_rate_pct": 53.85,
+  "profit_factor": 1.56,
+  "total_return_pct": 0.72,
+  "total_pnl": 718.74,
+  "initial_capital": 100000.0,
+  "final_equity": 100720.29,
+  "max_drawdown_pct": -1.0,
+  "sharpe_ratio": 0.68,
+  "avg_win": 286.87,
+  "avg_loss": -214.89,
+  "avg_trade": 55.29,
+  "avg_win_loss_ratio": 1.33,
+  "max_win_streak": 4,
+  "max_loss_streak": 3,
+  "exit_reasons": {
+    "Stop-loss": 6,
+    "Take-profit": 6,
+    "End of backtest": 1
+  }
+}
