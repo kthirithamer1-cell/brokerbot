@@ -8,6 +8,7 @@ Usage:
     python main.py backtest       — Backtest the trained model
     python main.py scan-pennies   — Scan for top penny stock picks
     python main.py paper-trade    — Start paper trading (requires TWS/Gateway)
+    python main.py monitor        — Show model health report
     python main.py info           — Show configuration summary
 """
 
@@ -78,11 +79,33 @@ def train(ctx, symbols, years, tune, tune_trials):
     if years:
         config["strategy"]["lookback_years"] = years
 
+    # Determine training timeframe and period
+    train_timeframe = config["strategy"].get("timeframe", "1d")
+    train_years = config["strategy"].get("lookback_years", 1)
+    # yfinance caps 15m/5m data at 60 days
+    if train_timeframe in ("15m", "5m"):
+        train_period = "60d"
+    elif train_timeframe in ("1h", "1H"):
+        train_period = "2y"  # yfinance allows up to 2y for 1h
+    else:
+        train_period = f"{train_years}y"
+
+    # Read ensemble/model config
+    model_cfg = config.get("model", {})
+    ensemble_method = model_cfg.get("ensemble_method", "single")
+
+    # Read label generation config
+    label_mode = config["strategy"].get("label_mode", "fixed")
+    label_atr_mult = config["strategy"].get("label_atr_multiplier", 1.5)
+
     logger.info("=" * 60)
     logger.info("🧠 TRAINING ML MODEL")
     logger.info(f"   Symbols: {', '.join(symbol_list)}")
-    logger.info(f"   Lookback: {config['strategy'].get('lookback_years', 5)} years")
+    logger.info(f"   Timeframe: {train_timeframe} | Period: {train_period}")
     logger.info(f"   Model: {config['strategy'].get('model_type', 'xgboost')}")
+    logger.info(f"   Ensemble: {ensemble_method}")
+    logger.info(f"   Label mode: {label_mode} (ATR mult: {label_atr_mult})")
+    logger.info(f"   Feature selection: {model_cfg.get('feature_selection', True)}")
     logger.info("=" * 60)
 
     data_loader = DataLoader(config_path)
@@ -97,8 +120,8 @@ def train(ctx, symbols, years, tune, tune_trials):
     for symbol in symbol_list:
         logger.info(f"\n📦 Processing {symbol}...")
 
-        # Fetch price data
-        df = data_loader.fetch_price_data(symbol)
+        # Fetch price data (use correct timeframe and capped period)
+        df = data_loader.fetch_price_data(symbol, period=train_period, interval=train_timeframe)
         if df.empty or len(df) < 100:
             logger.warning(f"  Insufficient data for {symbol}, skipping")
             continue
@@ -114,16 +137,28 @@ def train(ctx, symbols, years, tune, tune_trials):
         except Exception as e:
             logger.warning(f"  Sentiment failed: {e}")
 
-        # Engineer features
+        # Engineer features (including new microstructure, regime, statistical)
         features = feature_engine.compute_features(df, sentiment_features)
         if features.empty:
             continue
 
-        # Create labels
-        horizon = config["strategy"].get("label_horizon_days", 5)
-        threshold = config["strategy"].get("label_threshold_pct", 1.5)
+        # Create labels (convert horizon days to bars based on timeframe)
+        horizon_days = config["strategy"].get("label_horizon_days", 2)
+        timeframe = config["strategy"].get("timeframe", "1d")
+        if timeframe in ("1h", "1H"):
+            horizon_bars = max(int(horizon_days * 7), 5)  # 7 hourly bars per trading day
+        elif timeframe == "15m":
+            horizon_bars = max(int(horizon_days * 26), 10)
+        else:
+            horizon_bars = max(int(horizon_days), 1)
+
+        threshold = config["strategy"].get("label_threshold_pct", 2.0)
         labels = feature_engine.create_labels(
-            features, horizon=horizon, threshold_pct=threshold
+            features,
+            horizon=horizon_bars,
+            threshold_pct=threshold,
+            mode=label_mode,
+            atr_multiplier=label_atr_mult,
         )
 
         # Align and drop NaN labels
@@ -135,7 +170,8 @@ def train(ctx, symbols, years, tune, tune_trials):
         all_features.append(combined[feature_cols])
         all_labels.append(combined["label"])
 
-        logger.info(f"  ✅ {len(combined)} samples, {len(feature_cols)} features")
+        logger.info(f"  ✅ {len(combined)} samples, {len(feature_cols)} features "
+                     f"(horizon={horizon_bars} bars, mode={label_mode})")
 
     if not all_features:
         logger.error("❌ No training data collected. Check data sources.")
@@ -159,11 +195,16 @@ def train(ctx, symbols, years, tune, tune_trials):
         logger.info(f"   Best F1: {result['best_f1']:.4f}")
     else:
         # Walk-forward validation first
-        logger.info("\n📈 Walk-forward validation...")
+        logger.info("\n📈 Walk-forward validation (purged)...")
         wf_results = ml_model.walk_forward_validate(X, y, n_splits=5)
 
-        # Then train on full data
-        logger.info("\n🏋️ Training on full dataset...")
+        if "error" not in wf_results:
+            logger.info(f"   Walk-forward accuracy: {wf_results['overall_accuracy']:.4f}")
+            logger.info(f"   Walk-forward F1: {wf_results['overall_f1']:.4f}")
+            logger.info(f"   Buy signal win rate: {wf_results['buy_signal_win_rate']:.4f}")
+
+        # Then train on full data with ensemble
+        logger.info(f"\n🏋️ Training {ensemble_method} model on full dataset...")
         ml_model.train(X, y)
 
     # Save model
@@ -178,15 +219,19 @@ def train(ctx, symbols, years, tune, tune_trials):
             bar = "█" * int(row["importance"] * 100)
             logger.info(f"   {row['feature']:>30} | {bar} {row['importance']:.4f}")
 
+    # Model health baseline
+    logger.info("\n📊 Model health baseline set from training metrics")
+
 
 @cli.command()
 @click.option("--symbol", default="SPY", help="Symbol to backtest")
 @click.option("--period", default="1y", help="Historical period to download (default: 1y)")
 @click.option("--days", default=None, type=int, help="Limit backtest to the most recent N days (e.g. 7 for 1 week)")
-@click.option("--interval", default="1d", help="Bar timeframe: 1d, 1h, 15m, 5m (default: 1d)")
+@click.option("--interval", default="1h", help="Bar timeframe: 1d, 1h, 15m, 5m (default: 1h)")
 @click.option("--capital", default=None, type=float, help="Initial capital in dollars (e.g. 30)")
+@click.option("--confidence", default=None, type=float, help="Confidence threshold (e.g. 0.35)")
 @click.pass_context
-def backtest(ctx, symbol, period, days, interval, capital):
+def backtest(ctx, symbol, period, days, interval, capital, confidence):
     """Backtest the trained model on historical data (supports 1 week via --days 7)."""
     import pandas as pd
     from data_loader import DataLoader
@@ -231,8 +276,8 @@ def backtest(ctx, symbol, period, days, interval, capital):
     if interval == "1d":
         fetch_period = "2y"
     elif interval in ("15m", "5m"):
-        fetch_period = "1mo"
-    elif interval == "1h":
+        fetch_period = "60d"     # yfinance caps 15m at 60 days
+    elif interval in ("1h", "1H"):
         fetch_period = "3mo"
     else:
         fetch_period = period
@@ -254,9 +299,24 @@ def backtest(ctx, symbol, period, days, interval, capital):
     # Get ML signals
     with open(config_path) as f:
         config = yaml.safe_load(f)
-    threshold = config["strategy"].get("confidence_threshold", 0.60)
+    threshold = confidence if confidence is not None else config["strategy"].get("confidence_threshold", 0.35)
 
     signals = ml_model.predict(predict_features, confidence_threshold=threshold)
+
+    # ── Debug: show what the model actually predicted ──
+    logger.info(f"\n📊 SIGNAL DIAGNOSTICS (confidence threshold = {threshold}):")
+    raw_counts = signals["raw_signal"].value_counts().to_dict()
+    final_counts = signals["signal"].value_counts().to_dict()
+    logger.info(f"   Raw predictions (before threshold): BUY={raw_counts.get(1,0)}, SELL={raw_counts.get(-1,0)}, HOLD={raw_counts.get(0,0)}")
+    logger.info(f"   After threshold filter:             BUY={final_counts.get(1,0)}, SELL={final_counts.get(-1,0)}, HOLD={final_counts.get(0,0)}")
+    if "confidence" in signals.columns:
+        logger.info(f"   Confidence stats: min={signals['confidence'].min():.3f}, "
+                     f"mean={signals['confidence'].mean():.3f}, "
+                     f"max={signals['confidence'].max():.3f}")
+    if "prob_buy" in signals.columns:
+        logger.info(f"   Buy probability:  min={signals['prob_buy'].min():.3f}, "
+                     f"mean={signals['prob_buy'].mean():.3f}, "
+                     f"max={signals['prob_buy'].max():.3f}")
 
     # Align prices with signals
     prices = df.loc[signals.index]
@@ -271,10 +331,16 @@ def backtest(ctx, symbol, period, days, interval, capital):
             return
         logger.info(f"Filtered to the most recent {len(prices)} bars (last {days} days)")
 
+        # Show filtered signal counts too
+        filt_counts = signals["signal"].value_counts().to_dict()
+        logger.info(f"   Signals in window: BUY={filt_counts.get(1,0)}, SELL={filt_counts.get(-1,0)}, HOLD={filt_counts.get(0,0)}")
+
     # Run backtest
     results = backtester.run(prices, signals)
 
-    logger.info(f"\n✅ Backtest complete — {results['metrics']['total_trades']} trades")
+    logger.info(f"\n✅ Backtest complete — {results['metrics']['total_trades']} trades "
+                 f"(Long: {results['metrics'].get('long_trades', '?')}, "
+                 f"Short: {results['metrics'].get('short_trades', '?')})")
 
 
 @cli.command("scan-pennies")
@@ -325,6 +391,47 @@ def paper_trade(ctx):
 
 @cli.command()
 @click.pass_context
+def monitor(ctx):
+    """Show model health report and prediction quality analysis."""
+    from model_monitor import ModelMonitor
+    from ml_model import MLModel
+
+    config_path = ctx.obj["config"]
+
+    logger.info("=" * 60)
+    logger.info("🧠 MODEL HEALTH MONITOR")
+    logger.info("=" * 60)
+
+    monitor = ModelMonitor(config_path)
+
+    # Load training accuracy baseline
+    try:
+        ml_model = MLModel(config_path)
+        ml_model.load("trading_model")
+        training_acc = ml_model.training_metrics.get("train_accuracy", 0)
+        if training_acc:
+            monitor.set_training_baseline(accuracy=training_acc)
+            logger.info(f"Training baseline: {training_acc:.4f}")
+    except FileNotFoundError:
+        logger.warning("No trained model found — some metrics unavailable")
+
+    # Print health report
+    monitor.print_health_report()
+
+    # Print regime performance
+    regime_perf = monitor.get_regime_performance()
+    if regime_perf.get("status") != "insufficient_data":
+        logger.info("\n📊 Performance by Regime:")
+        for regime, stats in regime_perf.items():
+            if isinstance(stats, dict):
+                logger.info(f"   {regime:>10}: accuracy={stats['accuracy']:.2%}, "
+                             f"avg_pnl=${stats['avg_pnl']:+.2f}, "
+                             f"total_pnl=${stats['total_pnl']:+.2f} "
+                             f"({stats['count']} trades)")
+
+
+@cli.command()
+@click.pass_context
 def info(ctx):
     """Show current configuration summary."""
     config_path = ctx.obj["config"]
@@ -360,11 +467,17 @@ def info(ctx):
 
         # Strategy
         strat = config.get("strategy", {})
+        model_cfg = config.get("model", {})
         console.print(Panel(
             f"  Timeframe: {strat.get('timeframe')}\n"
             f"  Model: {strat.get('model_type')}\n"
+            f"  Ensemble: {model_cfg.get('ensemble_method', 'single')}\n"
+            f"  Base models: {', '.join(model_cfg.get('base_models', []))}\n"
+            f"  Feature selection: {model_cfg.get('feature_selection', True)}\n"
+            f"  Max features: {model_cfg.get('max_features', 30)}\n"
             f"  Lookback: {strat.get('lookback_years')}y\n"
             f"  Confidence: {strat.get('confidence_threshold')}\n"
+            f"  Label mode: {strat.get('label_mode', 'fixed')}\n"
             f"  Label horizon: {strat.get('label_horizon_days')}d\n"
             f"  Label threshold: {strat.get('label_threshold_pct')}%",
             title="🧠 Strategy",
@@ -373,6 +486,7 @@ def info(ctx):
 
         # Risk
         risk = config.get("risk", {})
+        targets = config.get("targets", {})
         console.print(Panel(
             f"  Max risk/trade: {risk.get('max_risk_per_trade_pct')}%\n"
             f"  Max position: {risk.get('max_position_pct')}%\n"
@@ -380,10 +494,27 @@ def info(ctx):
             f"  Max positions: {risk.get('max_open_positions')}\n"
             f"  SL ATR mult: {risk.get('stop_loss_atr_mult')}x\n"
             f"  TP ATR mult: {risk.get('take_profit_atr_mult')}x\n"
-            f"  Trailing stop: {risk.get('trailing_stop_pct')}%",
+            f"  Trailing stop: {risk.get('trailing_stop_pct')}%\n"
+            f"  Time stop: {risk.get('time_stop_bars', 'N/A')} bars\n"
+            f"  Daily profit target: ${targets.get('daily_profit_target', 5.0)}\n"
+            f"  Scale down at: {targets.get('scale_down_at_pct', 60)}% of target\n"
+            f"  Stop trading at: {targets.get('stop_trading_at_pct', 120)}% of target",
             title="🛡️ Risk Management",
             border_style="yellow",
         ))
+
+        # Regime
+        regime_cfg = config.get("regime", {})
+        if regime_cfg.get("enabled"):
+            console.print(Panel(
+                f"  Enabled: {regime_cfg.get('enabled')}\n"
+                f"  Volatility lookback: {regime_cfg.get('volatility_lookback')} bars\n"
+                f"  Trend ADX threshold: {regime_cfg.get('trend_strength_min_adx')}\n"
+                f"  High vol threshold: {regime_cfg.get('high_vol_threshold')}%ile\n"
+                f"  Low vol threshold: {regime_cfg.get('low_vol_threshold')}%ile",
+                title="📊 Regime Detection",
+                border_style="bright_blue",
+            ))
 
         # Penny Scanner
         penny = config.get("penny_scanner", {})
@@ -407,8 +538,10 @@ def info(ctx):
                 console.print(Panel(
                     f"  Status: ✅ Trained\n"
                     f"  Type: {meta.get('model_type')}\n"
+                    f"  Ensemble: {meta.get('ensemble_method', 'single')}\n"
                     f"  Trained at: {meta.get('saved_at', 'Unknown')}\n"
-                    f"  Features: {len(meta.get('feature_names', []))}",
+                    f"  Features (original): {len(meta.get('feature_names', []))}\n"
+                    f"  Features (selected): {len(meta.get('selected_features', meta.get('feature_names', [])))}",
                     title="🤖 Model Status",
                     border_style="green",
                 ))

@@ -1,0 +1,3 @@
+entry_date,exit_date,entry_price,exit_price,shares,stop_loss,take_profit,pnl,pnl_pct,exit_reason,commission
+2026-08-26 13:30:00-04:00,2026-08-26 14:30:00-04:00,15.8929,16.007,1,15.2804,18.4358,0.11,0.72,Sell signal,0.01
+2026-08-28 11:30:00-04:00,2026-08-28 13:30:00-04:00,15.3527,15.2095,1,14.863,17.8091,-0.15,-0.93,Sell signal,0.01

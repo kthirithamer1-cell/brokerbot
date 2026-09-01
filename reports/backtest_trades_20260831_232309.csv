@@ -1,0 +1,2 @@
+entry_date,exit_date,entry_price,exit_price,shares,stop_loss,take_profit,pnl,pnl_pct,exit_reason,commission
+2026-08-26 15:45:00-04:00,2026-08-27 09:30:00-04:00,1.7909,1.7542,15,1.7551,1.8625,-0.63,-2.05,Stop-loss,0.15

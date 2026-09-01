@@ -1,0 +1,3 @@
+entry_date,exit_date,type,entry_price,exit_price,shares,stop_loss,take_profit,pnl,pnl_pct,exit_reason,commission
+2026-09-01 09:45:00-04:00,2026-09-01 12:00:00-04:00,short,0.6197,0.689,43,0.6977,0.4896,-2.98,-11.19,Buy signal (close short),0.43
+2026-09-01 12:00:00-04:00,2026-09-01 15:45:00-04:00,long,0.689,0.6597,34,0.6111,0.8189,-1.17,-4.26,End of backtest,0.34

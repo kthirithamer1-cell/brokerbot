@@ -1,9 +1,9 @@
 """
 ml_model.py — Machine Learning Model Training & Prediction
 ==========================================================
-Trains XGBoost / LightGBM on engineered features using
-walk-forward validation. Supports hyperparameter tuning
-with Optuna.
+Supports single models (XGBoost, LightGBM, CatBoost) and
+ensemble methods (voting, stacking) with walk-forward purged
+cross-validation, feature selection, and adaptive confidence.
 """
 
 import logging
@@ -25,6 +25,14 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import (
+    VotingClassifier,
+    RandomForestClassifier,
+    ExtraTreesClassifier,
+    StackingClassifier,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SelectFromModel
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +42,12 @@ class MLModel:
     ML model for stock signal prediction.
 
     Supports:
-        - XGBoost and LightGBM
-        - Walk-forward (expanding window) validation
+        - XGBoost, LightGBM, and CatBoost
+        - Ensemble methods: soft voting and stacking
+        - Walk-forward (expanding window) validation with purge gap
         - Hyperparameter tuning via Optuna
+        - Feature selection via importance-based pruning
+        - Adaptive confidence threshold
         - Probability-based predictions with confidence thresholds
     """
 
@@ -48,13 +59,32 @@ class MLModel:
         self.model = None
         self.label_encoder = LabelEncoder()
         self.feature_names = None
+        self.selected_features = None  # After feature selection
+        self.feature_selector = None
         self.model_dir = Path("models")
         self.model_dir.mkdir(exist_ok=True)
         self.training_metrics = {}
 
-    def _create_model(self, params: dict | None = None):
-        """Create a fresh model instance with given or default params."""
-        if self.model_type == "xgboost":
+        # Ensemble config
+        model_cfg = self.config.get("model", {})
+        self.ensemble_method = model_cfg.get("ensemble_method", "single")
+        self.base_model_types = model_cfg.get("base_models", ["xgboost", "lightgbm"])
+        self.enable_feature_selection = model_cfg.get("feature_selection", True)
+        self.max_features = model_cfg.get("max_features", 30)
+        self.purge_gap = model_cfg.get("purge_gap_bars", 5)
+        self.embargo_bars = model_cfg.get("embargo_bars", 3)
+
+        # Adaptive confidence tracking
+        self._prediction_log = []  # List of (predicted, actual, confidence) tuples
+        self._adaptive_threshold = None
+
+    # ──────────────────────────────────────────────
+    #  MODEL FACTORIES
+    # ──────────────────────────────────────────────
+
+    def _create_single_model(self, model_type: str, params: dict | None = None):
+        """Create a single model instance."""
+        if model_type == "xgboost":
             import xgboost as xgb
 
             default_params = {
@@ -74,9 +104,9 @@ class MLModel:
             }
             if params:
                 default_params.update(params)
-            self.model = xgb.XGBClassifier(**default_params)
+            return xgb.XGBClassifier(**default_params)
 
-        elif self.model_type == "lightgbm":
+        elif model_type == "lightgbm":
             import lightgbm as lgb
 
             default_params = {
@@ -96,10 +126,157 @@ class MLModel:
             }
             if params:
                 default_params.update(params)
-            self.model = lgb.LGBMClassifier(**default_params)
+            return lgb.LGBMClassifier(**default_params)
+
+        elif model_type == "catboost":
+            from catboost import CatBoostClassifier
+
+            default_params = {
+                "iterations": 500,
+                "depth": 6,
+                "learning_rate": 0.05,
+                "l2_leaf_reg": 3.0,
+                "random_seed": 42,
+                "verbose": 0,
+                "task_type": "CPU",
+                "loss_function": "MultiClass",
+            }
+            if params:
+                default_params.update(params)
+            return CatBoostClassifier(**default_params)
+
+        elif model_type == "random_forest":
+            return RandomForestClassifier(
+                n_estimators=300,
+                max_depth=8,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                random_state=42,
+                n_jobs=-1,
+            )
+
+        elif model_type == "extra_trees":
+            return ExtraTreesClassifier(
+                n_estimators=300,
+                max_depth=8,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                random_state=42,
+                n_jobs=-1,
+            )
 
         else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
+            raise ValueError(f"Unknown model type: {model_type}")
+
+    def _create_model(self, params: dict | None = None):
+        """Create the model based on ensemble configuration."""
+        if self.ensemble_method == "single":
+            self.model = self._create_single_model(self.model_type, params)
+
+        elif self.ensemble_method == "voting":
+            self.model = self._create_voting_ensemble(params)
+
+        elif self.ensemble_method == "stacking":
+            self.model = self._create_stacking_ensemble(params)
+
+        else:
+            raise ValueError(f"Unknown ensemble method: {self.ensemble_method}")
+
+    def _create_voting_ensemble(self, params: dict | None = None):
+        """Create a soft-voting ensemble of base models."""
+        estimators = []
+        for model_type in self.base_model_types:
+            try:
+                model = self._create_single_model(model_type, params)
+                estimators.append((model_type, model))
+            except Exception as e:
+                logger.warning(f"Failed to create {model_type} for ensemble: {e}")
+
+        if len(estimators) < 2:
+            logger.warning("Not enough models for ensemble, falling back to single model")
+            return self._create_single_model(self.model_type, params)
+
+        return VotingClassifier(
+            estimators=estimators,
+            voting="soft",
+            n_jobs=-1,
+        )
+
+    def _create_stacking_ensemble(self, params: dict | None = None):
+        """Create a stacking ensemble with a meta-learner."""
+        estimators = []
+        for model_type in self.base_model_types:
+            try:
+                model = self._create_single_model(model_type, params)
+                estimators.append((model_type, model))
+            except Exception as e:
+                logger.warning(f"Failed to create {model_type} for stacking: {e}")
+
+        if len(estimators) < 2:
+            logger.warning("Not enough models for stacking, falling back to single model")
+            return self._create_single_model(self.model_type, params)
+
+        return StackingClassifier(
+            estimators=estimators,
+            final_estimator=LogisticRegression(
+                max_iter=1000,
+                solver="lbfgs",
+                C=1.0,
+                random_state=42,
+            ),
+            cv=3,  # Internal CV for generating meta-features
+            stack_method="predict_proba",
+            n_jobs=-1,
+        )
+
+    # ──────────────────────────────────────────────
+    #  FEATURE SELECTION
+    # ──────────────────────────────────────────────
+
+    def _select_features(self, X: pd.DataFrame, y: np.ndarray) -> pd.DataFrame:
+        """
+        Select top features using importance-based pruning.
+
+        Trains a quick XGBoost model to rank features, then keeps the top N.
+        This reduces noise and overfitting, especially on small datasets.
+        """
+        if not self.enable_feature_selection or len(X.columns) <= self.max_features:
+            self.selected_features = list(X.columns)
+            return X
+
+        logger.info(f"Feature selection: {len(X.columns)} → max {self.max_features}")
+
+        try:
+            import xgboost as xgb
+
+            # Quick model for feature ranking
+            selector_model = xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=4,
+                learning_rate=0.1,
+                random_state=42,
+                n_jobs=-1,
+                use_label_encoder=False,
+                eval_metric="mlogloss",
+            )
+            selector_model.fit(X, y)
+
+            # Get importances and select top features
+            importances = pd.Series(
+                selector_model.feature_importances_,
+                index=X.columns,
+            ).sort_values(ascending=False)
+
+            top_features = importances.head(self.max_features).index.tolist()
+            self.selected_features = top_features
+
+            logger.info(f"Selected {len(top_features)} features: {top_features[:10]}...")
+            return X[top_features]
+
+        except Exception as e:
+            logger.warning(f"Feature selection failed: {e}. Using all features.")
+            self.selected_features = list(X.columns)
+            return X
 
     # ──────────────────────────────────────────────
     #  TRAINING
@@ -122,34 +299,44 @@ class MLModel:
         Returns:
             Dict with training metrics
         """
-        logger.info(f"Training {self.model_type} on {len(X)} samples, {len(X.columns)} features")
+        logger.info(f"Training {self.ensemble_method} ({self.model_type}) on "
+                     f"{len(X)} samples, {len(X.columns)} features")
 
         self.feature_names = list(X.columns)
 
         # Encode labels: -1, 0, 1 → 0, 1, 2
         y_encoded = self.label_encoder.fit_transform(y)
 
+        # Feature selection
+        X_selected = self._select_features(X, y_encoded)
+
         self._create_model(params)
-        self.model.fit(X, y_encoded)
+        self.model.fit(X_selected, y_encoded)
 
         # Training accuracy
-        y_pred = self.model.predict(X)
+        y_pred = self.model.predict(X_selected)
         train_acc = accuracy_score(y_encoded, y_pred)
+        train_f1 = f1_score(y_encoded, y_pred, average="weighted", zero_division=0)
 
         self.training_metrics = {
             "train_accuracy": round(train_acc, 4),
+            "train_f1": round(train_f1, 4),
             "n_samples": len(X),
-            "n_features": len(X.columns),
+            "n_features_original": len(X.columns),
+            "n_features_selected": len(X_selected.columns),
             "model_type": self.model_type,
+            "ensemble_method": self.ensemble_method,
             "label_distribution": dict(pd.Series(y).value_counts().to_dict()),
             "trained_at": datetime.now().isoformat(),
         }
 
-        logger.info(f"Training accuracy: {train_acc:.4f}")
+        logger.info(f"Training accuracy: {train_acc:.4f}, F1: {train_f1:.4f}")
+        if self.selected_features:
+            logger.info(f"Using {len(self.selected_features)} selected features")
         return self.training_metrics
 
     # ──────────────────────────────────────────────
-    #  WALK-FORWARD VALIDATION
+    #  WALK-FORWARD VALIDATION (PURGED)
     # ──────────────────────────────────────────────
 
     def walk_forward_validate(
@@ -161,9 +348,10 @@ class MLModel:
         params: dict | None = None,
     ) -> dict:
         """
-        Walk-forward (expanding window) cross-validation.
+        Walk-forward (expanding window) cross-validation with purge gap.
 
         Always trains on past data and tests on future data — no lookahead bias.
+        Includes a purge gap between train and test to prevent label leakage.
 
         Args:
             X: Feature DataFrame (time-ordered)
@@ -175,7 +363,8 @@ class MLModel:
         Returns:
             Dict with per-fold and aggregate metrics
         """
-        logger.info(f"Walk-forward validation: {n_splits} splits, min_train={min_train_size}")
+        logger.info(f"Walk-forward validation: {n_splits} splits, min_train={min_train_size}, "
+                     f"purge_gap={self.purge_gap}, embargo={self.embargo_bars}")
 
         self.feature_names = list(X.columns)
         total_size = len(X)
@@ -192,46 +381,74 @@ class MLModel:
 
         for fold in range(n_splits):
             train_end = min_train_size + fold * step_size
-            test_end = min(train_end + step_size, total_size)
 
-            if test_end <= train_end:
+            # Apply purge gap: skip `purge_gap` bars between train and test
+            test_start = train_end + self.purge_gap
+            test_end = min(test_start + step_size, total_size)
+
+            # Apply embargo: skip `embargo_bars` after each test set
+            # (only affects training of subsequent folds, handled by train_end)
+
+            if test_end <= test_start or test_start >= total_size:
                 break
 
             X_train = X.iloc[:train_end]
             y_train = y.iloc[:train_end]
-            X_test = X.iloc[train_end:test_end]
-            y_test = y.iloc[train_end:test_end]
+            X_test = X.iloc[test_start:test_end]
+            y_test = y.iloc[test_start:test_end]
+
+            if len(X_test) < 5:
+                continue
 
             # Encode labels
             le = LabelEncoder()
             y_train_enc = le.fit_transform(y_train)
             y_test_enc = le.transform(y_test)
 
+            # Feature selection on training set only
+            X_train_sel = self._select_features(X_train, y_train_enc)
+            X_test_sel = X_test[self.selected_features] if self.selected_features else X_test
+
             # Train
             self._create_model(params)
-            self.model.fit(X_train, y_train_enc)
+            self.model.fit(X_train_sel, y_train_enc)
 
             # Predict
-            y_pred_enc = self.model.predict(X_test)
-            y_prob = self.model.predict_proba(X_test)
+            y_pred_enc = self.model.predict(X_test_sel)
+            y_prob = self.model.predict_proba(X_test_sel)
 
             # Metrics
             acc = accuracy_score(y_test_enc, y_pred_enc)
             f1 = f1_score(y_test_enc, y_pred_enc, average="weighted", zero_division=0)
 
+            # Precision for BUY signals specifically
+            buy_label = le.transform([1])[0] if 1 in le.classes_ else None
+            if buy_label is not None:
+                buy_precision = precision_score(
+                    y_test_enc, y_pred_enc, labels=[buy_label], average="micro", zero_division=0
+                )
+            else:
+                buy_precision = 0.0
+
             fold_info = {
                 "fold": fold + 1,
                 "train_size": len(X_train),
                 "test_size": len(X_test),
+                "purge_gap": self.purge_gap,
                 "accuracy": round(acc, 4),
                 "f1_weighted": round(f1, 4),
+                "buy_precision": round(buy_precision, 4),
             }
             fold_metrics.append(fold_info)
-            logger.info(f"  Fold {fold+1}: acc={acc:.4f}, f1={f1:.4f} "
+            logger.info(f"  Fold {fold+1}: acc={acc:.4f}, f1={f1:.4f}, "
+                        f"buy_prec={buy_precision:.4f} "
                         f"(train={len(X_train)}, test={len(X_test)})")
 
             all_y_true.extend(y_test_enc.tolist())
             all_y_pred.extend(y_pred_enc.tolist())
+
+        if not all_y_true:
+            return {"error": "No valid folds completed"}
 
         # Store the label encoder from the last fold for consistency
         self.label_encoder = le
@@ -256,6 +473,8 @@ class MLModel:
 
         results = {
             "n_splits": n_splits,
+            "purge_gap_bars": self.purge_gap,
+            "embargo_bars": self.embargo_bars,
             "overall_accuracy": round(overall_acc, 4),
             "overall_f1": round(overall_f1, 4),
             "buy_signal_win_rate": round(win_rate, 4),
@@ -292,6 +511,10 @@ class MLModel:
 
         logger.info(f"Starting Optuna tuning: {n_trials} trials")
 
+        # Save original ensemble method and temporarily switch to single for speed
+        original_ensemble = self.ensemble_method
+        self.ensemble_method = "single"
+
         def objective(trial):
             if self.model_type == "xgboost":
                 params = {
@@ -304,7 +527,7 @@ class MLModel:
                     "reg_alpha": trial.suggest_float("reg_alpha", 0.001, 10.0, log=True),
                     "reg_lambda": trial.suggest_float("reg_lambda", 0.001, 10.0, log=True),
                 }
-            else:  # lightgbm
+            elif self.model_type == "lightgbm":
                 params = {
                     "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
                     "max_depth": trial.suggest_int("max_depth", 3, 10),
@@ -315,6 +538,15 @@ class MLModel:
                     "reg_alpha": trial.suggest_float("reg_alpha", 0.001, 10.0, log=True),
                     "reg_lambda": trial.suggest_float("reg_lambda", 0.001, 10.0, log=True),
                 }
+            elif self.model_type == "catboost":
+                params = {
+                    "iterations": trial.suggest_int("iterations", 100, 1000),
+                    "depth": trial.suggest_int("depth", 3, 10),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.1, 10.0, log=True),
+                }
+            else:
+                params = {}
 
             result = self.walk_forward_validate(X, y, n_splits=n_splits, params=params)
             return result.get("overall_f1", 0.0)
@@ -328,7 +560,8 @@ class MLModel:
         logger.info(f"Best F1 score: {best_score:.4f}")
         logger.info(f"Best params: {best_params}")
 
-        # Re-train with best params on full data
+        # Restore ensemble method and re-train with best params on full data
+        self.ensemble_method = original_ensemble
         self.train(X, y, params=best_params)
 
         return {"best_params": best_params, "best_f1": best_score}
@@ -353,13 +586,21 @@ class MLModel:
 
         # Align features
         X_aligned = X.copy()
-        if self.feature_names:
+
+        # Apply feature selection if active
+        if self.selected_features:
+            missing = set(self.selected_features) - set(X_aligned.columns)
+            if missing:
+                logger.warning(f"Missing features (filling with 0): {missing}")
+                for col in missing:
+                    X_aligned[col] = 0.0
+            X_aligned = X_aligned[self.selected_features]
+        elif self.feature_names:
             missing = set(self.feature_names) - set(X_aligned.columns)
             if missing:
                 logger.warning(f"Missing features (filling with 0): {missing}")
                 for col in missing:
                     X_aligned[col] = 0.0
-            # Ensure exact column order
             X_aligned = X_aligned[self.feature_names]
 
         y_pred_enc = self.model.predict(X_aligned)
@@ -382,15 +623,115 @@ class MLModel:
         results["raw_signal"] = y_pred
         results["confidence"] = np.max(y_prob, axis=1)
 
+        # Use adaptive threshold if available, otherwise use provided threshold
+        effective_threshold = self.get_adaptive_threshold() or confidence_threshold
+
         # Apply confidence threshold
         results["signal"] = results.apply(
             lambda row: row["raw_signal"]
-            if row["confidence"] >= confidence_threshold
+            if row["confidence"] >= effective_threshold
             else 0,
             axis=1,
         )
 
+        results["effective_threshold"] = effective_threshold
+
         return results
+
+    # ──────────────────────────────────────────────
+    #  ADAPTIVE CONFIDENCE THRESHOLD
+    # ──────────────────────────────────────────────
+
+    def log_prediction_outcome(self, predicted: int, actual: int, confidence: float):
+        """Log a prediction outcome for adaptive threshold tracking."""
+        self._prediction_log.append({
+            "predicted": predicted,
+            "actual": actual,
+            "confidence": confidence,
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        # Keep only recent predictions
+        monitoring_cfg = self.config.get("monitoring", {})
+        window = monitoring_cfg.get("rolling_accuracy_window", 50)
+        if len(self._prediction_log) > window * 2:
+            self._prediction_log = self._prediction_log[-window:]
+
+    def get_adaptive_threshold(self) -> float | None:
+        """
+        Compute adaptive confidence threshold based on recent prediction accuracy.
+
+        Returns higher threshold when model has been less accurate recently,
+        and lower threshold when model is performing well.
+        """
+        monitoring_cfg = self.config.get("monitoring", {})
+        if not monitoring_cfg.get("enabled", False):
+            return None
+
+        window = monitoring_cfg.get("rolling_accuracy_window", 50)
+
+        if len(self._prediction_log) < 20:
+            return None  # Not enough data to adapt
+
+        recent = self._prediction_log[-window:]
+
+        # Compute rolling accuracy for non-HOLD predictions
+        actionable = [p for p in recent if p["predicted"] != 0]
+        if len(actionable) < 10:
+            return None
+
+        accuracy = sum(
+            1 for p in actionable if p["predicted"] == p["actual"]
+        ) / len(actionable)
+
+        # Adaptive threshold: lower accuracy → higher required confidence
+        # Base threshold from config
+        base_threshold = self.config["strategy"].get("confidence_threshold", 0.28)
+        training_acc = self.training_metrics.get("train_accuracy", 0.5)
+
+        # If recent accuracy is much worse than training, raise threshold
+        accuracy_ratio = accuracy / (training_acc + 1e-10)
+        if accuracy_ratio < 0.7:
+            # Model is degrading significantly — raise threshold by up to 50%
+            adjusted = base_threshold * (1 + (1 - accuracy_ratio) * 0.5)
+        elif accuracy_ratio > 1.1:
+            # Model is doing better than training — slightly lower threshold
+            adjusted = base_threshold * 0.9
+        else:
+            adjusted = base_threshold
+
+        self._adaptive_threshold = round(np.clip(adjusted, 0.15, 0.70), 3)
+        return self._adaptive_threshold
+
+    def get_model_health(self) -> dict:
+        """Get current model health metrics."""
+        monitoring_cfg = self.config.get("monitoring", {})
+        window = monitoring_cfg.get("rolling_accuracy_window", 50)
+
+        if len(self._prediction_log) < 10:
+            return {"status": "insufficient_data", "predictions_logged": len(self._prediction_log)}
+
+        recent = self._prediction_log[-window:]
+        actionable = [p for p in recent if p["predicted"] != 0]
+
+        if not actionable:
+            return {"status": "no_actionable_predictions"}
+
+        accuracy = sum(1 for p in actionable if p["predicted"] == p["actual"]) / len(actionable)
+        training_acc = self.training_metrics.get("train_accuracy", 0.5)
+        decay_pct = (1 - accuracy / (training_acc + 1e-10)) * 100
+
+        decay_threshold = monitoring_cfg.get("decay_threshold_pct", 10)
+
+        return {
+            "status": "healthy" if decay_pct < decay_threshold else "degraded",
+            "rolling_accuracy": round(accuracy, 4),
+            "training_accuracy": round(training_acc, 4),
+            "accuracy_decay_pct": round(decay_pct, 2),
+            "predictions_logged": len(self._prediction_log),
+            "adaptive_threshold": self._adaptive_threshold,
+            "needs_retrain": decay_pct >= decay_threshold,
+        }
 
     # ──────────────────────────────────────────────
     #  FEATURE IMPORTANCE
@@ -401,15 +742,39 @@ class MLModel:
         if self.model is None:
             return pd.DataFrame()
 
-        importance = self.model.feature_importances_
-        names = self.feature_names or [f"f_{i}" for i in range(len(importance))]
+        try:
+            # For ensemble models, try to extract from base estimators
+            if hasattr(self.model, "feature_importances_"):
+                importance = self.model.feature_importances_
+            elif hasattr(self.model, "estimators_"):
+                # Voting/Stacking: average importances from base estimators
+                all_importances = []
+                for name, est in self.model.estimators_:
+                    if hasattr(est, "feature_importances_"):
+                        all_importances.append(est.feature_importances_)
+                if all_importances:
+                    importance = np.mean(all_importances, axis=0)
+                else:
+                    return pd.DataFrame()
+            else:
+                return pd.DataFrame()
 
-        df = pd.DataFrame({
-            "feature": names,
-            "importance": importance,
-        }).sort_values("importance", ascending=False)
+            names = self.selected_features or self.feature_names or [f"f_{i}" for i in range(len(importance))]
 
-        return df.head(top_n).reset_index(drop=True)
+            # Handle mismatched lengths
+            if len(names) != len(importance):
+                names = [f"f_{i}" for i in range(len(importance))]
+
+            df = pd.DataFrame({
+                "feature": names,
+                "importance": importance,
+            }).sort_values("importance", ascending=False)
+
+            return df.head(top_n).reset_index(drop=True)
+
+        except Exception as e:
+            logger.warning(f"Could not extract feature importance: {e}")
+            return pd.DataFrame()
 
     # ──────────────────────────────────────────────
     #  SAVE / LOAD
@@ -427,13 +792,17 @@ class MLModel:
             "model": self.model,
             "label_encoder": self.label_encoder,
             "feature_names": self.feature_names,
+            "selected_features": self.selected_features,
             "model_type": self.model_type,
+            "ensemble_method": self.ensemble_method,
         }, model_path)
 
         with open(meta_path, "w") as f:
             json.dump({
                 "model_type": self.model_type,
+                "ensemble_method": self.ensemble_method,
                 "feature_names": self.feature_names,
+                "selected_features": self.selected_features,
                 "training_metrics": self.training_metrics,
                 "saved_at": datetime.now().isoformat(),
             }, f, indent=2, default=str)
@@ -451,9 +820,18 @@ class MLModel:
         self.model = data["model"]
         self.label_encoder = data["label_encoder"]
         self.feature_names = data["feature_names"]
+        self.selected_features = data.get("selected_features")
         self.model_type = data["model_type"]
+        self.ensemble_method = data.get("ensemble_method", "single")
 
-        logger.info(f"Model loaded from {model_path}")
+        # Load training metrics from meta file
+        meta_path = self.model_dir / f"{name}_meta.json"
+        if meta_path.exists():
+            with open(meta_path) as f:
+                meta = json.load(f)
+                self.training_metrics = meta.get("training_metrics", {})
+
+        logger.info(f"Model loaded from {model_path} (ensemble={self.ensemble_method})")
 
 
 # ──────────────────────────────────────────────
@@ -468,9 +846,6 @@ if __name__ == "__main__":
     X = pd.DataFrame(np.random.randn(n, 10), columns=[f"feat_{i}" for i in range(10)])
     y = pd.Series(np.random.choice([-1, 0, 1], size=n, p=[0.25, 0.50, 0.25]))
 
-    model = MLModel()
-    model._create_model = lambda params=None: setattr(model, "model_type", "xgboost") or model._create_model.__wrapped__(model, params) if hasattr(model._create_model, "__wrapped__") else None
-
     # Simple train test
     model = MLModel()
     metrics = model.train(X, y)
@@ -482,3 +857,7 @@ if __name__ == "__main__":
     print(f"  Accuracy: {wf['overall_accuracy']}")
     print(f"  F1 Score: {wf['overall_f1']}")
     print(f"  Buy Win Rate: {wf['buy_signal_win_rate']}")
+
+    # Model health
+    health = model.get_model_health()
+    print(f"\nModel health: {health}")

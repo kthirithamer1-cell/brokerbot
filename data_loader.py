@@ -80,6 +80,13 @@ class DataLoader:
                 df = ticker.history(start=start, end=end, interval=interval)
             else:
                 df = ticker.history(period=period, interval=interval)
+                # If 5y is empty (common for penny stocks/recent IPOs/SPACs), fallback to shorter periods
+                if df.empty and period not in ("2y", "1y", "6mo", "max"):
+                    for fallback in ["2y", "1y", "6mo", "max"]:
+                        logger.info(f"Retrying {symbol} with fallback period={fallback}")
+                        df = ticker.history(period=fallback, interval=interval)
+                        if not df.empty:
+                            break
 
             if df.empty:
                 logger.warning(f"No data returned for {symbol}")
@@ -157,41 +164,19 @@ class DataLoader:
                 except Exception:
                     pass
 
-            # Method 2: Use yfinance screener query
-            # Fetch a list of active US stocks and filter
-            try:
-                from yfinance import Screener
-                sc = Screener()
-                sc.set_default_body({
-                    "query": {
-                        "operator": "AND",
-                        "operands": [
-                            {"operator": "LT", "operands": ["regularmarketprice", 5.0]},
-                            {"operator": "GT", "operands": ["regularmarketprice", 0.5]},
-                            {"operator": "GT", "operands": ["avgdailyvol10day", 500000]},
-                        ],
-                    },
-                    "size": 250,
-                    "offset": 0,
-                    "sortField": "avgdailyvol10day",
-                    "sortType": "DESC",
-                })
-                result = sc.response
-                if "quotes" in result:
-                    for q in result["quotes"]:
-                        screener_symbols.add(q["symbol"])
-            except Exception as e:
-                logger.warning(f"yfinance Screener not available: {e}")
-
-            # Method 3: Fallback — curated active sub-$10 tickers
-            fallback_pennies = [
-                "SOFI", "PLUG", "NIO", "LCID", "MARA", "RIOT", "OPEN", "CLOV",
-                "DNA", "TELL", "GSAT", "SNDL", "BTBT", "BNGO", "WKHS", "BARK",
-                "PSFE", "BB", "NOK", "FCEL", "ZOM", "CTRM", "SENS", "MVIS",
-                "CLNE", "GEVO", "BLNK", "QS", "LAZR", "AEVA", "OUST", "ACHR",
-                "JOBY", "RIVN", "GRAB", "WBD", "PENN", "RUN", "PLUG", "SEDG"
+            # Method 2: Expand with comprehensive active sub-$10 / small-cap momentum universe
+            expanded_pennies = [
+                # Top Volatile Penny Stocks ($0.50 - $5)
+                "SNDL", "CLNE", "GEVO", "MVIS", "BLNK", "DNA", "TELL", "GSAT",
+                "BTBT", "BNGO", "WKHS", "BARK", "PSFE", "FCEL", "ZOM", "CTRM",
+                "SENS", "AEVA", "OUST", "CAN", "HUT", "BITF", "WULF",
+                # High-Volume Small-Cap / Growth ($2 - $10)
+                "PLUG", "SOFI", "NIO", "LCID", "MARA", "RIOT", "OPEN", "CLOV",
+                "BB", "NOK", "QS", "LAZR", "ACHR", "JOBY", "RIVN", "GRAB",
+                "PENN", "RUN", "CIFR", "IREN", "CLSK", "SOUN", "BBAI", "LUNR",
+                "ASTS", "RKLB"
             ]
-            screener_symbols.update(fallback_pennies)
+            screener_symbols.update(expanded_pennies)
 
             logger.info(f"Penny universe: {len(screener_symbols)} candidates")
             return list(screener_symbols)

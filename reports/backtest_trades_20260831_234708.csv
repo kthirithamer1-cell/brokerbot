@@ -1,0 +1,2 @@
+entry_date,exit_date,entry_price,exit_price,shares,stop_loss,take_profit,pnl,pnl_pct,exit_reason,commission
+2026-08-28 11:45:00-04:00,2026-08-31 15:45:00-04:00,0.5766,0.5897,46,0.5633,0.5988,0.37,2.27,End of backtest,0.46

@@ -1,0 +1,2 @@
+{"timestamp": "2026-09-01T21:58:49.206845", "symbol": "TEST", "predicted_signal": 1, "confidence": 0.65, "prob_buy": 0.65, "prob_sell": 0.15, "prob_hold": 0.2, "actual_outcome": 1, "pnl": 1.5, "regime": "trending"}
+{"timestamp": "2026-09-01T22:01:52.760835", "symbol": "TEST", "predicted_signal": 1, "confidence": 0.65, "prob_buy": 0.65, "prob_sell": 0.15, "prob_hold": 0.2, "actual_outcome": 1, "pnl": 1.5, "regime": "trending"}

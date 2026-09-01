@@ -1,0 +1,21 @@
+{
+  "total_trades": 0,
+  "winning_trades": 0,
+  "losing_trades": 0,
+  "win_rate_pct": 0.0,
+  "profit_factor": 0.0,
+  "total_return_pct": 0.0,
+  "total_pnl": 0.0,
+  "initial_capital": 30.0,
+  "final_equity": 30.0,
+  "max_drawdown_pct": 0.0,
+  "sharpe_ratio": 0.0,
+  "avg_win": 0.0,
+  "avg_loss": 0.0,
+  "avg_trade": 0.0,
+  "avg_win_loss_ratio": 0.0,
+  "max_win_streak": 0,
+  "max_loss_streak": 0,
+  "exit_reasons": {},
+  "note": "No trades executed with current confidence threshold"
+}

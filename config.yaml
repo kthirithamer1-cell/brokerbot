@@ -1,6 +1,7 @@
 # ============================================
 # IBKR AI Trading Bot — Configuration
 # ============================================
+# TARGET: +$5/week on $30 capital (15-minute scalping)
 
 # --- IBKR Connection ---
 ibkr:
@@ -9,18 +10,18 @@ ibkr:
   client_id: 1
   account: ""         # Leave empty to auto-detect
 
-# --- Watchlist ---
+# --- Watchlist: High-Beta Momentum Stocks ---
 watchlist:
   symbols:
-    - SPY
-    - AAPL
-    - MSFT
-    - NVDA
-    - TSLA
-    - AMD
-    - META
-    - GOOGL
-    - AMZN
+    - PLUG
+    - MARA
+    - RIOT
+    - SOUN
+    - LUNR
+    - ASTS
+    - CLSK
+    - SOFI
+    - SNDL
 
 # --- Penny Stock Scanner ---
 penny_scanner:
@@ -43,25 +44,84 @@ penny_scanner:
     sentiment: 0.20
     relative_strength: 0.15
 
-# --- Strategy / ML ---
+# --- Strategy / ML: 15-Minute Fast Scalper ---
 strategy:
-  timeframe: "1d"              # 1d, 1h, 15m, 5m
-  lookback_years: 5            # How many years of historical data for training
-  label_horizon_days: 5        # Forward-looking period for labeling
-  label_threshold_pct: 1.5     # % move threshold for BUY/SELL labels
-  confidence_threshold: 0.40   # Increased from 0.60 to only enter high-conviction trades
-  model_type: "xgboost"        # xgboost or lightgbm
-  retrain_interval_days: 30    # Re-train model every N days
+  timeframe: "15m"             # 15-minute candles for maximum trade frequency
+  lookback_years: 1            # 1 year of training data
+  label_horizon_days: 1        # Look for moves within 1 trading day (~26 bars)
+  label_threshold_pct: 1.0     # Detect +1.0% intraday breakouts (was 2.5% — too high!)
+  label_mode: "atr_relative"   # "fixed" = old static threshold | "atr_relative" = dynamic ATR-based
+  label_atr_multiplier: 1.5    # Label BUY when forward return > 1.5 × ATR(14)
+  confidence_threshold: 0.28   # 3-class model rarely exceeds 0.50; 0.28 captures strong signals
+  model_type: "xgboost"
+  retrain_interval_days: 7     # Retrain weekly for fast-moving penny stocks
 
-# --- Risk Management ---
+# --- Model Ensemble Configuration ---
+model:
+  ensemble_method: "stacking"    # "single" | "voting" | "stacking"
+  base_models:                   # Models used in ensemble (ignored when ensemble_method=single)
+    - "xgboost"
+    - "lightgbm"
+    - "catboost"
+  feature_selection: true        # Enable automatic feature pruning
+  max_features: 30               # Max features to keep after selection
+  purge_gap_bars: 5              # Gap between train/test in walk-forward to prevent label leakage
+  embargo_bars: 3                # Embargo after test set to prevent look-ahead
+
+# --- Regime Detection ---
+regime:
+  enabled: true
+  volatility_lookback: 50        # Periods to compute volatility percentile rank
+  trend_strength_min_adx: 25     # ADX above this = trending market
+  high_vol_threshold: 75         # Volatility percentile above this = high regime
+  low_vol_threshold: 25          # Volatility percentile below this = low regime
+
+# --- Daily Targets ---
+targets:
+  daily_profit_target: 5.0       # Daily profit target in dollars
+  scale_down_at_pct: 60          # Scale down position sizes at 60% of target ($3)
+  stop_trading_at_pct: 120       # Stop trading for the day at 120% of target ($6)
+
+# --- Model Monitoring ---
+monitoring:
+  enabled: true
+  rolling_accuracy_window: 50    # Rolling window for accuracy tracking
+  decay_threshold_pct: 10        # Alert if accuracy drops >10% vs training
+  auto_retrain: true             # Automatically retrain when accuracy decays
+  feature_drift_threshold: 2.0   # Z-score threshold for feature drift detection
+
+# --- Market Session Awareness ---
+session:
+  avoid_first_minutes: 5         # Avoid trading the first N minutes after market open
+  power_hour_start: "15:00"      # Power hour starts at 3:00 PM ET
+  power_hour_boost: 1.2          # Increase position size by 20% during power hour
+  midday_penalty: 0.7            # Reduce position size by 30% during 11:30-14:30 (low vol)
+
+# --- Risk Management: Tight Scalp Parameters ---
 risk:
-  max_risk_per_trade_pct: 1.5  # Max % of account equity risked per trade
-  max_position_pct: 5.0        # Max % of portfolio in one position
-  max_daily_loss_pct: 3.0      # Daily drawdown kill-switch (% of account)
-  max_open_positions: 10       # Maximum simultaneous positions
-  stop_loss_atr_mult: 5      # Gives penny stocks room to avoid noise
-  take_profit_atr_mult: 4.5    # Targets large breakout moves
-  trailing_stop_pct: 2.0       # Trailing stop as % below high watermark
+  max_risk_per_trade_pct: 3.0  # Risk 3% of capital per trade
+  max_position_pct: 90.0       # Deploy 90% on micro account ($30)
+  max_daily_loss_pct: 8.0      # Daily drawdown kill-switch
+  max_open_positions: 3        # Focus on top 3 setups
+  stop_loss_atr_mult: 1.5      # Tight 1.5x ATR stop-loss (quick cut)
+  take_profit_atr_mult: 2.5    # Realistic 2.5x ATR profit target
+  trailing_stop_pct: 1.5       # Trail 1.5% below high watermark (lock profits fast)
+  # Adaptive stop-loss by regime
+  regime_stops:
+    trending:
+      stop_loss_atr_mult: 1.2   # Tighter stop in trends, let profits run
+      take_profit_atr_mult: 3.5  # Wider target in trends
+    ranging:
+      stop_loss_atr_mult: 2.5   # Wider stop in ranges, avoid whipsaws
+      take_profit_atr_mult: 1.8  # Tighter target in ranges (mean-revert)
+    volatile:
+      stop_loss_atr_mult: 2.0   # Moderate stop in volatile regimes
+      take_profit_atr_mult: 2.5  # Moderate target
+  # Time-based stop
+  time_stop_bars: 26             # Close position if no movement after 26 bars (~1 trading day for 15m)
+  time_stop_min_move_pct: 0.3    # Minimum move required to keep position open
+  # Correlation-based exposure
+  max_correlation: 0.70          # Max correlation allowed between simultaneous positions
 
 # --- Sentiment / News ---
 sentiment:
@@ -72,9 +132,12 @@ sentiment:
 
 # --- Backtesting ---
 backtest:
-  initial_capital: 100000.0
+  initial_capital: 30.0        # Match your actual capital
   commission_per_share: 0.005  # IBKR tiered rate
   slippage_pct: 0.05           # 5 basis points slippage estimate
+  enable_shorts: true          # Enable short selling in backtests
+  monte_carlo_iterations: 1000 # Number of Monte Carlo shuffles
+  monte_carlo_confidence: 0.95 # Confidence level for Monte Carlo intervals
 
 # --- Logging ---
 logging:

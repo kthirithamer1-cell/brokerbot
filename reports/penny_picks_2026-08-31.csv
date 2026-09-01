@@ -1,0 +1,8 @@
+symbol,name,price,sector,volume_surge_score,momentum_score,technical_score,sentiment_score,relative_strength_score,total_score,ml_confidence,volume_ratio,return_5d_pct,return_10d_pct,key_catalyst,suggested_stop_loss,suggested_target,rank
+SNDL,SNDL Inc.,1.36,Consumer Defensive,18.9,72.7,70.0,50.0,45.8,50.1,0.0,0.57,-0.74,10.56,Technical breakout,1.25,1.56,1
+CLNE,Clean Energy Fuels Corp.,1.61,Energy,9.7,60.4,63.0,50.0,60.6,46.2,0.0,0.29,2.23,-0.31,Technical breakout,1.48,1.85,2
+GEVO,"Gevo, Inc.",1.65,Basic Materials,11.9,57.8,70.0,50.0,37.7,44.2,0.0,0.36,-2.37,7.84,Technical breakout,1.52,1.9,3
+MVIS,"Microvision, Inc.",1.8,Technology,8.6,44.8,50.0,50.0,45.1,37.9,0.0,0.26,-0.88,-0.33,Multi-factor,1.65,2.06,4
+SENS,"Senseonics Holdings, Inc.",9.18,Healthcare,6.1,44.6,70.0,16.2,30.6,32.3,0.0,0.18,-3.78,5.41,Technical breakout + Contrarian (neg. sentiment),8.43,10.53,5
+BLNK,Blink Charging Co.,0.51,Industrials,28.6,0.0,68.0,50.0,0.0,30.7,0.0,0.86,-13.14,-8.02,Technical breakout,0.47,0.59,6
+DNA,"Ginkgo Bioworks Holdings, Inc.",6.76,Healthcare,10.7,10.4,63.0,43.4,0.0,26.0,0.0,0.32,-9.92,4.01,Technical breakout,6.25,7.81,7

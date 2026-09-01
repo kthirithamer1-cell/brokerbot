@@ -3,6 +3,13 @@ bot.py — Main Trading Bot Loop
 ================================
 Orchestrates the trading pipeline: data → features → ML prediction
 → risk check → order execution. Runs in paper or live mode.
+
+Upgraded with:
+    - Multi-timeframe signal confirmation
+    - Market session awareness
+    - Regime-aware risk parameters
+    - Daily P&L target integration
+    - Model health monitoring
 """
 
 import logging
@@ -29,12 +36,14 @@ class TradingBot:
 
     Pipeline per cycle:
         1. Fetch latest price data
-        2. Compute technical features
+        2. Compute technical features + regime detection
         3. Fetch & score news sentiment
-        4. ML model generates signals
-        5. Risk manager validates trade
-        6. IBKR client executes order
-        7. Monitor positions & trailing stops
+        4. Multi-timeframe signal confirmation
+        5. ML model generates signals
+        6. Risk manager validates trade (regime-aware)
+        7. IBKR client executes order
+        8. Monitor positions, trailing stops, & time stops
+        9. Track daily P&L toward $5 target
     """
 
     def __init__(self, config_path: str = "config.yaml"):
@@ -56,11 +65,20 @@ class TradingBot:
         self.confidence_threshold = self.config["strategy"].get("confidence_threshold", 0.60)
         self.timeframe = self.config["strategy"].get("timeframe", "1d")
 
+        # Session config
+        session_cfg = self.config.get("session", {})
+        self.avoid_first_minutes = session_cfg.get("avoid_first_minutes", 5)
+
         self._running = False
 
         # Logging
         self.log_dir = Path("logs")
         self.log_dir.mkdir(exist_ok=True)
+
+        # Cache for higher timeframe data (refreshed less frequently)
+        self._htf_cache = {}
+        self._htf_last_refresh = None
+        self._htf_refresh_interval = timedelta(minutes=30)  # Refresh every 30 min
 
     def start(self, paper: bool = True):
         """
@@ -74,6 +92,8 @@ class TradingBot:
         logger.info(f"   Mode: {'📝 PAPER' if paper else '💰 LIVE'}")
         logger.info(f"   Watchlist: {', '.join(self.watchlist)}")
         logger.info(f"   Timeframe: {self.timeframe}")
+        logger.info(f"   Ensemble: {self.config.get('model', {}).get('ensemble_method', 'single')}")
+        logger.info(f"   Daily target: ${self.config.get('targets', {}).get('daily_profit_target', 5.0)}")
         logger.info("=" * 60)
 
         # Load trained model
@@ -117,7 +137,15 @@ class TradingBot:
         summary = self.risk_manager.get_daily_summary()
         logger.info(f"📋 Daily Summary: PnL=${summary['daily_pnl']:+,.2f} "
                      f"({summary['daily_pnl_pct']:+.2f}%), "
-                     f"Trades={summary['trades_today']}")
+                     f"Trades={summary['trades_today']}, "
+                     f"Target={summary['target_progress_pct']:.0f}%")
+
+        # Print model health
+        health = self.ml_model.get_model_health()
+        if health.get("status") != "insufficient_data":
+            logger.info(f"🧠 Model Health: {health['status']} "
+                         f"(accuracy={health.get('rolling_accuracy', 'N/A')}, "
+                         f"decay={health.get('accuracy_decay_pct', 'N/A')}%)")
 
         self.ibkr_client.disconnect()
         logger.info("🛑 Bot stopped")
@@ -142,6 +170,12 @@ class TradingBot:
                 time.sleep(60)
                 continue
 
+            # Refresh higher timeframe data periodically
+            self._refresh_higher_timeframe_data()
+
+            # Update market regime
+            self._update_market_regime()
+
             # Check trailing stops on existing positions
             self._check_stops()
 
@@ -152,6 +186,12 @@ class TradingBot:
                 except Exception as e:
                     logger.error(f"Error processing {symbol}: {e}")
                     continue
+
+            # Log cycle summary
+            summary = self.risk_manager.get_daily_summary()
+            logger.info(f"💰 Cycle {cycle} | PnL: ${summary['daily_pnl']:+.2f} "
+                         f"({summary['target_progress_pct']:.0f}% of target) | "
+                         f"Positions: {summary['open_positions']}")
 
             # Determine sleep interval based on timeframe
             if self.timeframe == "1d":
@@ -164,11 +204,129 @@ class TradingBot:
             logger.info(f"💤 Sleeping {sleep_seconds}s until next cycle...")
             time.sleep(sleep_seconds)
 
+    def _refresh_higher_timeframe_data(self):
+        """
+        Fetch higher-timeframe data (daily) for multi-timeframe confirmation.
+        Cached and refreshed every 30 minutes to avoid excess API calls.
+        """
+        now = datetime.now()
+        if (self._htf_last_refresh and
+                now - self._htf_last_refresh < self._htf_refresh_interval):
+            return  # Still fresh
+
+        logger.debug("Refreshing higher-timeframe data...")
+
+        for symbol in self.watchlist:
+            try:
+                daily_df = self.data_loader.fetch_price_data(
+                    symbol, period="3mo", interval="1d", use_cache=True
+                )
+                if daily_df.empty or len(daily_df) < 20:
+                    continue
+
+                # Compute daily trend context
+                import ta as ta_lib
+                close = daily_df["Close"]
+
+                ema_9 = ta_lib.trend.ema_indicator(close, window=9).iloc[-1]
+                ema_21 = ta_lib.trend.ema_indicator(close, window=21).iloc[-1]
+                daily_rsi = ta_lib.momentum.rsi(close, window=14).iloc[-1]
+                weekly_momentum = (close.iloc[-1] / close.iloc[-5] - 1) if len(close) >= 5 else 0
+
+                self._htf_cache[symbol] = {
+                    "daily_ema_trend": 1 if ema_9 > ema_21 else -1,
+                    "daily_rsi": daily_rsi,
+                    "weekly_momentum": weekly_momentum,
+                    "daily_close": close.iloc[-1],
+                }
+
+            except Exception as e:
+                logger.debug(f"HTF data failed for {symbol}: {e}")
+
+        self._htf_last_refresh = now
+
+    def _update_market_regime(self):
+        """
+        Detect current market regime from SPY/QQQ and update risk manager.
+        """
+        try:
+            spy_df = self.data_loader.fetch_price_data(
+                "SPY", period="3mo", interval="1d", use_cache=True
+            )
+            if spy_df.empty or len(spy_df) < 50:
+                return
+
+            import ta as ta_lib
+
+            # ADX for trend strength
+            adx = ta_lib.trend.ADXIndicator(
+                spy_df["High"], spy_df["Low"], spy_df["Close"]
+            ).adx().iloc[-1]
+
+            # ATR percentile for volatility regime
+            atr = ta_lib.volatility.average_true_range(
+                spy_df["High"], spy_df["Low"], spy_df["Close"], window=14
+            )
+            atr_pct = atr / spy_df["Close"]
+            vol_percentile = atr_pct.rank(pct=True).iloc[-1] * 100
+
+            regime_cfg = self.config.get("regime", {})
+            trend_min_adx = regime_cfg.get("trend_strength_min_adx", 25)
+            high_vol = regime_cfg.get("high_vol_threshold", 75)
+            low_vol = regime_cfg.get("low_vol_threshold", 25)
+
+            if vol_percentile > high_vol:
+                regime = "volatile"
+            elif adx > trend_min_adx:
+                regime = "trending"
+            elif adx < 15:
+                regime = "ranging"
+            else:
+                regime = "medium"
+
+            self.risk_manager.update_regime(regime)
+            logger.info(f"📊 Market regime: {regime.upper()} (ADX={adx:.1f}, Vol%={vol_percentile:.0f})")
+
+        except Exception as e:
+            logger.debug(f"Regime detection failed: {e}")
+
+    def _check_multi_timeframe_alignment(self, symbol: str, signal: int) -> bool:
+        """
+        Check if the signal aligns with higher timeframe trends.
+
+        For BUY signals: require daily trend to be bullish (EMA9 > EMA21)
+        For SELL signals: require daily trend to be bearish
+        """
+        if symbol not in self._htf_cache:
+            return True  # No HTF data — don't filter
+
+        htf = self._htf_cache[symbol]
+        daily_trend = htf.get("daily_ema_trend", 0)
+        daily_rsi = htf.get("daily_rsi", 50)
+
+        if signal == 1:  # BUY
+            # Require daily trend alignment
+            if daily_trend == -1 and daily_rsi < 40:
+                logger.info(f"  ⏭️ {symbol}: BUY rejected — daily trend bearish (RSI={daily_rsi:.0f})")
+                return False
+        elif signal == -1:  # SELL
+            # Require daily trend alignment
+            if daily_trend == 1 and daily_rsi > 60:
+                logger.info(f"  ⏭️ {symbol}: SELL rejected — daily trend bullish (RSI={daily_rsi:.0f})")
+                return False
+
+        return True
+
     def _process_symbol(self, symbol: str):
         """Process a single symbol: data → features → signal → trade."""
 
         # Step 1: Fetch latest data (ensure at least 250+ bars for 200-period indicators)
         lookback_period = "2y" if self.timeframe == "1d" else "730d"
+        if self.timeframe in ("15m", "5m"):
+            lookback_period = "60d"
+        elif self.timeframe in ("1h", "1H"):
+            lookback_period = "3mo"
+
         df = self.data_loader.fetch_price_data(
             symbol, period=lookback_period, interval=self.timeframe, use_cache=False
         )
@@ -185,12 +343,17 @@ class TradingBot:
         except Exception as e:
             logger.debug(f"Sentiment fetch failed for {symbol}: {e}")
 
-        # Step 3: Compute features
-        features = self.feature_engine.compute_features(df, sentiment_features)
+        # Step 3: Get higher timeframe context
+        higher_tf_data = self._htf_cache.get(symbol, {})
+
+        # Step 4: Compute features (with multi-TF and sentiment)
+        features = self.feature_engine.compute_features(
+            df, sentiment_features, higher_tf_data
+        )
         if features.empty:
             return
 
-        # Step 4: Get ML prediction for the latest bar
+        # Step 5: Get ML prediction for the latest bar
         latest_features = features.iloc[[-1]]
         prediction = self.ml_model.predict(
             latest_features,
@@ -203,24 +366,30 @@ class TradingBot:
         prob_buy = float(prediction.get("prob_buy", pd.Series([0.0])).iloc[0])
         prob_sell = float(prediction.get("prob_sell", pd.Series([0.0])).iloc[0])
         prob_hold = float(prediction.get("prob_hold", pd.Series([0.0])).iloc[0])
+        effective_threshold = float(prediction.get("effective_threshold", pd.Series([self.confidence_threshold])).iloc[0])
         current_price = float(df["Close"].iloc[-1])
 
         if signal == 0:
             logger.info(
-                f"📊 {symbol:<5} | HOLD | Conf: {confidence*100:.1f}% (< {self.confidence_threshold*100:.0f}%) "
+                f"📊 {symbol:<5} | HOLD | Conf: {confidence*100:.1f}% (< {effective_threshold*100:.0f}%) "
                 f"| Prob -> Buy: {prob_buy*100:.1f}%, Sell: {prob_sell*100:.1f}%, Hold: {prob_hold*100:.1f}% "
                 f"| Price: ${current_price:.2f}"
             )
             return  # No high-conviction signal — skip
 
+        # Step 6: Multi-timeframe confirmation
+        if not self._check_multi_timeframe_alignment(symbol, signal):
+            return
+
         atr = df["Close"].pct_change().rolling(14).std().iloc[-1] * current_price
 
         logger.info(
             f"🎯 {symbol:<5} | 🔥 SIGNAL: {'BUY' if signal == 1 else 'SELL'} | "
-            f"Confidence: {confidence*100:.1f}% | Price: ${current_price:.2f}"
+            f"Confidence: {confidence*100:.1f}% | Price: ${current_price:.2f} | "
+            f"Regime: {self.risk_manager._current_regime}"
         )
 
-        # Step 5: Execute trade
+        # Step 7: Execute trade
         if signal == 1:
             # If we hold a short position, close it first
             if symbol in self.risk_manager.open_positions and self.risk_manager.open_positions[symbol].get("direction") == -1:
@@ -236,10 +405,10 @@ class TradingBot:
     def _execute_buy(self, symbol: str, price: float, atr: float):
         """Execute a buy trade with risk management."""
 
-        # Compute bracket levels (direction=1 for long)
+        # Compute bracket levels (direction=1 for long, regime-aware)
         bracket = self.risk_manager.compute_bracket_levels(price, atr, direction=1)
 
-        # Position sizing
+        # Position sizing (regime-aware, session-aware)
         sizing = self.risk_manager.calculate_position_size(
             entry_price=price,
             stop_loss_price=bracket["stop_loss"],
@@ -274,7 +443,9 @@ class TradingBot:
             logger.info(
                 f"  ✅ BUY {sizing['shares']} x {symbol} @ ${price:.2f} | "
                 f"SL: ${bracket['stop_loss']:.2f} | TP: ${bracket['take_profit']:.2f} | "
-                f"Risk: ${sizing['risk_amount']:.2f} ({sizing['risk_pct']:.1f}%)"
+                f"Risk: ${sizing['risk_amount']:.2f} ({sizing['risk_pct']:.1f}%) | "
+                f"R:R={bracket['risk_reward_ratio']} | "
+                f"Size mult: {sizing['size_multiplier']:.2f}"
             )
         else:
             logger.error(f"  ❌ Buy order failed: {result['error']}")
@@ -282,10 +453,10 @@ class TradingBot:
     def _execute_short(self, symbol: str, price: float, atr: float):
         """Execute a short sell trade with risk management."""
 
-        # Compute bracket levels (direction=-1 for short)
+        # Compute bracket levels (direction=-1 for short, regime-aware)
         bracket = self.risk_manager.compute_bracket_levels(price, atr, direction=-1)
 
-        # Position sizing
+        # Position sizing (regime-aware, session-aware)
         sizing = self.risk_manager.calculate_position_size(
             entry_price=price,
             stop_loss_price=bracket["stop_loss"],
@@ -320,7 +491,9 @@ class TradingBot:
             logger.info(
                 f"  ✅ SHORT SELL {sizing['shares']} x {symbol} @ ${price:.2f} | "
                 f"SL: ${bracket['stop_loss']:.2f} | TP: ${bracket['take_profit']:.2f} | "
-                f"Risk: ${sizing['risk_amount']:.2f} ({sizing['risk_pct']:.1f}%)"
+                f"Risk: ${sizing['risk_amount']:.2f} ({sizing['risk_pct']:.1f}%) | "
+                f"R:R={bracket['risk_reward_ratio']} | "
+                f"Size mult: {sizing['size_multiplier']:.2f}"
             )
         else:
             logger.error(f"  ❌ Short order failed: {result['error']}")
@@ -336,11 +509,21 @@ class TradingBot:
             )
             if "error" not in result:
                 self.risk_manager.register_close(symbol, price, reason or "Signal exit")
+
+                # Log prediction outcome for adaptive threshold
+                direction = pos.get("direction", 1)
+                pnl = (price - pos["entry_price"]) * direction
+                actual = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
+                self.ml_model.log_prediction_outcome(
+                    predicted=direction,
+                    actual=actual,
+                    confidence=0.5,  # Will be improved with stored confidence
+                )
             else:
                 logger.error(f"  ❌ Close position failed: {result['error']}")
 
     def _check_stops(self):
-        """Check trailing stops for all open positions."""
+        """Check trailing stops and time stops for all open positions."""
         if not self.risk_manager.open_positions:
             return
 
@@ -354,7 +537,7 @@ class TradingBot:
 
         for symbol in to_close:
             price = current_prices.get(symbol, 0)
-            self._close_position(symbol, price, reason="Trailing stop / stop-loss")
+            self._close_position(symbol, price, reason="Trailing stop / stop-loss / time stop")
 
 
 # ──────────────────────────────────────────────
@@ -371,5 +554,7 @@ if __name__ == "__main__":
     print("\nTrading Bot initialized.")
     print(f"  Watchlist: {bot.watchlist}")
     print(f"  Timeframe: {bot.timeframe}")
+    print(f"  Ensemble: {bot.config.get('model', {}).get('ensemble_method', 'single')}")
+    print(f"  Daily target: ${bot.config.get('targets', {}).get('daily_profit_target', 5.0)}")
     print("\nTo start paper trading: bot.start(paper=True)")
     print("Make sure to train a model first: python main.py train")

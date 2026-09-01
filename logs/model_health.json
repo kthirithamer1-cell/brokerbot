@@ -1,0 +1,16 @@
+{
+  "overall_status": "POOR \u2014 Model underperforming",
+  "generated_at": "2026-09-01T22:01:52.771829",
+  "total_predictions": 2,
+  "rolling_accuracy": {
+    "status": "insufficient_data",
+    "count": 2
+  },
+  "model_decay": {
+    "status": "insufficient_data",
+    "needs_retrain": false
+  },
+  "signal_quality": {
+    "status": "insufficient_data"
+  }
+}

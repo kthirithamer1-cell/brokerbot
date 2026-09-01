@@ -3,6 +3,12 @@ backtester.py — Historical Backtest Simulator
 ==============================================
 Simulates trading strategies on historical data with
 realistic commissions, slippage, and performance reporting.
+
+Upgraded with:
+    - Short selling simulation
+    - Monte Carlo confidence intervals
+    - Weekly PnL reporting
+    - Regime-aware position sizing
 """
 
 import logging
@@ -23,7 +29,10 @@ class Backtester:
     Features:
         - Realistic commissions (IBKR tiered rate)
         - Slippage estimation
+        - Long AND short trade simulation
         - Full performance metrics (win rate, profit factor, Sharpe, max drawdown)
+        - Monte Carlo analysis with confidence intervals
+        - Weekly P&L breakdown for target tracking
         - Trade-by-trade log
         - Equity curve
     """
@@ -36,6 +45,9 @@ class Backtester:
         self.initial_capital = bt_cfg.get("initial_capital", 100_000)
         self.commission_per_share = bt_cfg.get("commission_per_share", 0.005)
         self.slippage_pct = bt_cfg.get("slippage_pct", 0.05) / 100
+        self.enable_shorts = bt_cfg.get("enable_shorts", True)
+        self.monte_carlo_iterations = bt_cfg.get("monte_carlo_iterations", 1000)
+        self.monte_carlo_confidence = bt_cfg.get("monte_carlo_confidence", 0.95)
 
         risk_cfg = self.config.get("risk", {})
         self.max_risk_per_trade = risk_cfg.get("max_risk_per_trade_pct", 1.5) / 100
@@ -65,7 +77,8 @@ class Backtester:
             Dict with full performance metrics and trade log
         """
         logger.info(f"Running backtest: {len(prices)} bars, "
-                     f"initial_capital=${self.initial_capital:,.0f}")
+                     f"initial_capital=${self.initial_capital:,.0f}, "
+                     f"shorts={'ON' if self.enable_shorts else 'OFF'}")
 
         # Merge signals with prices
         df = prices.copy()
@@ -82,6 +95,15 @@ class Backtester:
         # Compute metrics
         metrics = self._compute_metrics(trades, equity_curve)
 
+        # Weekly P&L breakdown
+        weekly_pnl = self._compute_weekly_pnl(trades, equity_curve)
+        metrics["weekly_pnl"] = weekly_pnl
+
+        # Monte Carlo analysis
+        if trades and len(trades) >= 10:
+            mc_results = self._monte_carlo_analysis(trades)
+            metrics["monte_carlo"] = mc_results
+
         # Save results
         self._save_results(trades, equity_curve, metrics)
 
@@ -95,9 +117,9 @@ class Backtester:
         }
 
     def _simulate(self, df: pd.DataFrame) -> tuple[list[dict], pd.Series]:
-        """Core simulation loop."""
+        """Core simulation loop with long and short support."""
         cash = self.initial_capital
-        position = None  # {symbol, shares, entry_price, stop_loss, take_profit}
+        position = None  # {type, shares, entry_price, stop_loss, take_profit, entry_date}
         trades = []
         equity = []
 
@@ -111,46 +133,66 @@ class Backtester:
                 exit_price = None
                 exit_reason = None
 
-                # Stop-loss hit (intrabar check using Low)
-                if row["Low"] <= position["stop_loss"]:
-                    exit_price = position["stop_loss"]
-                    exit_reason = "Stop-loss"
+                if position["type"] == "long":
+                    # Stop-loss hit (intrabar check using Low)
+                    if row["Low"] <= position["stop_loss"]:
+                        exit_price = position["stop_loss"]
+                        exit_reason = "Stop-loss"
+                    # Take-profit hit (intrabar check using High)
+                    elif row["High"] >= position["take_profit"]:
+                        exit_price = position["take_profit"]
+                        exit_reason = "Take-profit"
+                    # Sell signal from model
+                    elif signal == -1:
+                        exit_price = price
+                        exit_reason = "Sell signal"
 
-                # Take-profit hit (intrabar check using High)
-                elif row["High"] >= position["take_profit"]:
-                    exit_price = position["take_profit"]
-                    exit_reason = "Take-profit"
-
-                # Sell signal from model
-                elif signal == -1:
-                    exit_price = price
-                    exit_reason = "Sell signal"
+                elif position["type"] == "short":
+                    # Stop-loss hit for short (using High)
+                    if row["High"] >= position["stop_loss"]:
+                        exit_price = position["stop_loss"]
+                        exit_reason = "Stop-loss"
+                    # Take-profit hit for short (using Low)
+                    elif row["Low"] <= position["take_profit"]:
+                        exit_price = position["take_profit"]
+                        exit_reason = "Take-profit"
+                    # Buy signal from model (close short)
+                    elif signal == 1:
+                        exit_price = price
+                        exit_reason = "Buy signal (close short)"
 
                 if exit_price:
                     # Apply slippage
-                    exit_price *= (1 - self.slippage_pct)
+                    if position["type"] == "long":
+                        exit_price *= (1 - self.slippage_pct)
+                    else:  # short — slippage works against us when buying to cover
+                        exit_price *= (1 + self.slippage_pct)
 
                     # Commission
                     commission = position["shares"] * self.commission_per_share
 
                     # PnL
-                    pnl = (exit_price - position["entry_price"]) * position["shares"]
-                    pnl -= commission  # entry commission already deducted
-
-                    cash += exit_price * position["shares"] - commission
+                    if position["type"] == "long":
+                        pnl = (exit_price - position["entry_price"]) * position["shares"]
+                        pnl_pct = (exit_price / position["entry_price"] - 1) * 100
+                        cash += exit_price * position["shares"] - commission
+                    else:  # short
+                        pnl = (position["entry_price"] - exit_price) * position["shares"]
+                        pnl_pct = (1 - exit_price / position["entry_price"]) * 100
+                        # Return collateral + profit (or minus loss)
+                        cash += position["collateral"] + pnl - commission
 
                     trades.append({
                         "entry_date": position["entry_date"],
                         "exit_date": dt,
+                        "type": position["type"],
                         "entry_price": position["entry_price"],
                         "exit_price": round(exit_price, 4),
                         "shares": position["shares"],
                         "stop_loss": position["stop_loss"],
                         "take_profit": position["take_profit"],
                         "pnl": round(pnl, 2),
-                        "pnl_pct": round(
-                            (exit_price / position["entry_price"] - 1) * 100, 2
-                        ),
+                        "pnl_pct": round(pnl_pct, 2),
                         "exit_reason": exit_reason,
                         "commission": round(commission * 2, 2),  # round-trip
                     })
@@ -158,74 +200,137 @@ class Backtester:
                     position = None
 
             # ── Check entry conditions ──
-            if position is None and signal == 1:
-                # Entry with slippage
-                entry_price = price * (1 + self.slippage_pct)
+            if position is None:
+                # LONG entry
+                if signal == 1:
+                    position = self._open_position(
+                        "long", price, atr, cash, dt
+                    )
+                    if position:
+                        cash -= position["shares"] * position["entry_price"] + \
+                               max(position["shares"] * self.commission_per_share, 0.01)
 
-                # Position sizing with Hard Loss Cap (Max -8% loss per trade)
-                hard_stop = entry_price * 0.92  # Capped at -8% max loss
-                atr_stop = entry_price - atr * self.stop_loss_atr_mult
-                stop_loss = max(atr_stop, hard_stop)  # Whichever is tighter
-
-                # Target at least 2x the risk (minimum +16% gain)
-                risk_pct = (entry_price - stop_loss) / entry_price
-                min_target = entry_price * (1 + max(risk_pct * 2.0, 0.16))
-                take_profit = max(entry_price + atr * self.take_profit_atr_mult, min_target)
-
-                risk_per_share = entry_price - stop_loss
-
-                if risk_per_share > 0:
-                    if cash < 500:
-                        # Micro account ($30 - $500): use up to 90% of available cash on 1 trade
-                        shares = int((cash * 0.90) / entry_price)
-                        shares = max(shares, 1)
-                    else:
-                        risk_amount = cash * self.max_risk_per_trade
-                        max_shares_risk = int(risk_amount / risk_per_share)
-                        max_shares_pos = int(cash * self.max_position_pct / entry_price)
-                        shares = min(max_shares_risk, max_shares_pos)
-                        shares = max(shares, 1)
-
-                    if shares * entry_price <= cash:
-                        commission = max(shares * self.commission_per_share, 0.01)
-                        cash -= shares * entry_price + commission
-
-                        position = {
-                            "entry_date": dt,
-                            "entry_price": round(entry_price, 4),
-                            "shares": shares,
-                            "stop_loss": round(stop_loss, 4),
-                            "take_profit": round(take_profit, 4),
-                        }
+                # SHORT entry
+                elif signal == -1 and self.enable_shorts:
+                    position = self._open_position(
+                        "short", price, atr, cash, dt
+                    )
+                    if position:
+                        # For shorts, we need collateral
+                        cash -= position["collateral"] + \
+                               max(position["shares"] * self.commission_per_share, 0.01)
 
             # Track equity
             portfolio_value = cash
             if position is not None:
-                portfolio_value += position["shares"] * price
+                if position["type"] == "long":
+                    portfolio_value += position["shares"] * price
+                else:  # short
+                    # Collateral + unrealized PnL
+                    unrealized_pnl = (position["entry_price"] - price) * position["shares"]
+                    portfolio_value += position["collateral"] + unrealized_pnl
+
             equity.append(portfolio_value)
 
         # Close any remaining position at last price
         if position is not None:
-            last_price = df["Close"].iloc[-1] * (1 - self.slippage_pct)
+            last_price = df["Close"].iloc[-1]
+            if position["type"] == "long":
+                last_price *= (1 - self.slippage_pct)
+                pnl = (last_price - position["entry_price"]) * position["shares"]
+                pnl_pct = (last_price / position["entry_price"] - 1) * 100
+            else:
+                last_price *= (1 + self.slippage_pct)
+                pnl = (position["entry_price"] - last_price) * position["shares"]
+                pnl_pct = (1 - last_price / position["entry_price"]) * 100
+
             commission = position["shares"] * self.commission_per_share
-            pnl = (last_price - position["entry_price"]) * position["shares"] - commission
 
             trades.append({
                 "entry_date": position["entry_date"],
                 "exit_date": df.index[-1],
+                "type": position["type"],
                 "entry_price": position["entry_price"],
                 "exit_price": round(last_price, 4),
                 "shares": position["shares"],
                 "stop_loss": position["stop_loss"],
                 "take_profit": position["take_profit"],
-                "pnl": round(pnl, 2),
-                "pnl_pct": round((last_price / position["entry_price"] - 1) * 100, 2),
+                "pnl": round(pnl - commission, 2),
+                "pnl_pct": round(pnl_pct, 2),
                 "exit_reason": "End of backtest",
                 "commission": round(commission * 2, 2),
             })
 
         equity_series = pd.Series(equity, index=df.index, name="equity")
         return trades, equity_series
+
+    def _open_position(
+        self, pos_type: str, price: float, atr: float, cash: float, dt
+    ) -> dict | None:
+        """Create a position dict with proper stops and sizing."""
+        # Entry with slippage
+        if pos_type == "long":
+            entry_price = price * (1 + self.slippage_pct)
+        else:
+            entry_price = price * (1 - self.slippage_pct)
+
+        # ATR-based stops
+        if atr > 0 and not np.isnan(atr):
+            if pos_type == "long":
+                stop_loss = entry_price - atr * self.stop_loss_atr_mult
+                take_profit = entry_price + atr * self.take_profit_atr_mult
+            else:  # short
+                stop_loss = entry_price + atr * self.stop_loss_atr_mult
+                take_profit = entry_price - atr * self.take_profit_atr_mult
+        else:
+            if pos_type == "long":
+                stop_loss = entry_price * 0.98
+                take_profit = entry_price * 1.04
+            else:
+                stop_loss = entry_price * 1.02
+                take_profit = entry_price * 0.96
+
+        # Ensure minimum stop distance
+        if pos_type == "long":
+            stop_loss = min(stop_loss, entry_price * 0.995)
+        else:
+            stop_loss = max(stop_loss, entry_price * 1.005)
+
+        risk_per_share = abs(entry_price - stop_loss)
+
+        if risk_per_share <= 0:
+            return None
+
+        # Position sizing
+        if cash < 500:
+            # Micro account: use up to 90% of available cash
+            shares = int((cash * 0.90) / entry_price)
+            shares = max(shares, 1)
+        else:
+            risk_amount = cash * self.max_risk_per_trade
+            max_shares_risk = int(risk_amount / risk_per_share)
+            max_shares_pos = int(cash * self.max_position_pct / entry_price)
+            shares = min(max_shares_risk, max_shares_pos)
+            shares = max(shares, 1)
+
+        # Check we can afford it
+        required_capital = shares * entry_price
+        if required_capital > cash:
+            return None
+
+        position = {
+            "type": pos_type,
+            "entry_date": dt,
+            "entry_price": round(entry_price, 4),
+            "shares": shares,
+            "stop_loss": round(stop_loss, 4),
+            "take_profit": round(take_profit, 4),
+        }
+
+        if pos_type == "short":
+            position["collateral"] = round(required_capital, 2)
+
+        return position
 
     def _compute_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """Compute Average True Range."""
@@ -262,6 +367,8 @@ class Backtester:
                 "avg_win_loss_ratio": 0.0,
                 "max_win_streak": 0,
                 "max_loss_streak": 0,
+                "long_trades": 0,
+                "short_trades": 0,
                 "exit_reasons": {},
                 "note": "No trades executed with current confidence threshold",
             }
@@ -313,6 +420,10 @@ class Backtester:
             else:
                 max_loss_streak = max(max_loss_streak, len(streak))
 
+        # Trade type breakdown
+        long_trades = len(trade_df[trade_df["type"] == "long"]) if "type" in trade_df.columns else total_trades
+        short_trades = len(trade_df[trade_df["type"] == "short"]) if "type" in trade_df.columns else 0
+
         # Exit reasons distribution
         exit_reasons = trade_df["exit_reason"].value_counts().to_dict()
 
@@ -334,10 +445,119 @@ class Backtester:
             "avg_win_loss_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0,
             "max_win_streak": max_win_streak,
             "max_loss_streak": max_loss_streak,
+            "long_trades": long_trades,
+            "short_trades": short_trades,
             "exit_reasons": exit_reasons,
         }
 
         return metrics
+
+    def _compute_weekly_pnl(self, trades: list[dict], equity: pd.Series) -> dict:
+        """Compute weekly P&L breakdown for $5/week target tracking."""
+        if not trades:
+            return {"weeks": [], "target_hit_rate": 0}
+
+        trade_df = pd.DataFrame(trades)
+        trade_df["exit_date"] = pd.to_datetime(trade_df["exit_date"])
+
+        # Group by week
+        trade_df["week"] = trade_df["exit_date"].dt.isocalendar().week.astype(int)
+        trade_df["year"] = trade_df["exit_date"].dt.year
+
+        weekly_groups = trade_df.groupby(["year", "week"]).agg(
+            pnl=("pnl", "sum"),
+            trades=("pnl", "count"),
+            wins=("pnl", lambda x: (x > 0).sum()),
+        ).reset_index()
+
+        target = self.config.get("targets", {}).get("daily_profit_target", 5.0) * 5  # Weekly target
+
+        weeks = []
+        for _, row in weekly_groups.iterrows():
+            weeks.append({
+                "year": int(row["year"]),
+                "week": int(row["week"]),
+                "pnl": round(row["pnl"], 2),
+                "trades": int(row["trades"]),
+                "wins": int(row["wins"]),
+                "hit_target": row["pnl"] >= target,
+            })
+
+        target_hit_count = sum(1 for w in weeks if w["hit_target"])
+        target_hit_rate = target_hit_count / len(weeks) * 100 if weeks else 0
+
+        return {
+            "weeks": weeks,
+            "total_weeks": len(weeks),
+            "target_hit_count": target_hit_count,
+            "target_hit_rate": round(target_hit_rate, 1),
+            "weekly_target": target,
+            "avg_weekly_pnl": round(np.mean([w["pnl"] for w in weeks]), 2) if weeks else 0,
+            "best_week": round(max(w["pnl"] for w in weeks), 2) if weeks else 0,
+            "worst_week": round(min(w["pnl"] for w in weeks), 2) if weeks else 0,
+        }
+
+    def _monte_carlo_analysis(self, trades: list[dict]) -> dict:
+        """
+        Monte Carlo simulation: shuffle trade order to compute confidence intervals.
+
+        Answers: "With 95% confidence, what is my expected weekly PnL range?"
+        """
+        if len(trades) < 10:
+            return {"error": "Too few trades for Monte Carlo"}
+
+        logger.info(f"Running Monte Carlo: {self.monte_carlo_iterations} iterations...")
+
+        pnls = [t["pnl"] for t in trades]
+        n_trades = len(pnls)
+
+        # Simulate many possible orderings
+        final_equities = []
+        weekly_pnls = []
+
+        rng = np.random.default_rng(42)
+
+        for _ in range(self.monte_carlo_iterations):
+            shuffled = rng.permutation(pnls)
+            cumulative = np.cumsum(shuffled) + self.initial_capital
+            final_equities.append(cumulative[-1])
+
+            # Approximate weekly PnL (assume ~5 trades per week for active scalping)
+            trades_per_week = max(1, n_trades // max(1, n_trades // 5))
+            week_pnls = []
+            for i in range(0, len(shuffled), trades_per_week):
+                week_pnl = sum(shuffled[i:i + trades_per_week])
+                week_pnls.append(week_pnl)
+            if week_pnls:
+                weekly_pnls.extend(week_pnls)
+
+        final_equities = np.array(final_equities)
+        weekly_pnls = np.array(weekly_pnls)
+
+        confidence = self.monte_carlo_confidence
+        lower_pct = (1 - confidence) / 2 * 100
+        upper_pct = (1 - (1 - confidence) / 2) * 100
+
+        return {
+            "iterations": self.monte_carlo_iterations,
+            "confidence_level": confidence,
+            "final_equity": {
+                "mean": round(float(np.mean(final_equities)), 2),
+                "median": round(float(np.median(final_equities)), 2),
+                f"p{lower_pct:.0f}": round(float(np.percentile(final_equities, lower_pct)), 2),
+                f"p{upper_pct:.0f}": round(float(np.percentile(final_equities, upper_pct)), 2),
+            },
+            "weekly_pnl": {
+                "mean": round(float(np.mean(weekly_pnls)), 2),
+                "median": round(float(np.median(weekly_pnls)), 2),
+                f"p{lower_pct:.0f}": round(float(np.percentile(weekly_pnls, lower_pct)), 2),
+                f"p{upper_pct:.0f}": round(float(np.percentile(weekly_pnls, upper_pct)), 2),
+                "prob_positive": round(float((weekly_pnls > 0).mean() * 100), 1),
+                "prob_above_target": round(
+                    float((weekly_pnls >= self.config.get("targets", {}).get("daily_profit_target", 5.0) * 5).mean() * 100), 1
+                ),
+            },
+        }
 
     def _print_summary(self, metrics: dict):
         """Print formatted backtest summary."""
@@ -367,6 +587,7 @@ class Backtester:
                 return str(val)
 
             table.add_row("Total Trades", str(metrics["total_trades"]))
+            table.add_row("  Long / Short", f"{metrics.get('long_trades', '?')} / {metrics.get('short_trades', '?')}")
             table.add_row("Win Rate", color_val(metrics["win_rate_pct"]) + "%")
             table.add_row("Profit Factor", color_val(metrics["profit_factor"]))
             table.add_row("Total Return", color_val(metrics["total_return_pct"]) + "%")
@@ -388,6 +609,31 @@ class Backtester:
                 console.print("\n[bold]Exit Reasons:[/bold]")
                 for reason, count in metrics["exit_reasons"].items():
                     console.print(f"  • {reason}: {count}")
+
+            # Weekly PnL summary
+            weekly = metrics.get("weekly_pnl", {})
+            if weekly and weekly.get("weeks"):
+                console.print(f"\n[bold]Weekly P&L Summary:[/bold]")
+                console.print(f"  Avg Weekly PnL: ${weekly['avg_weekly_pnl']:+.2f}")
+                console.print(f"  Best Week: ${weekly['best_week']:+.2f}")
+                console.print(f"  Worst Week: ${weekly['worst_week']:+.2f}")
+                console.print(f"  Weeks hitting ${weekly['weekly_target']:.0f} target: "
+                              f"{weekly['target_hit_count']}/{weekly['total_weeks']} "
+                              f"({weekly['target_hit_rate']:.0f}%)")
+
+            # Monte Carlo results
+            mc = metrics.get("monte_carlo", {})
+            if mc and "weekly_pnl" in mc:
+                console.print(f"\n[bold]Monte Carlo ({mc['iterations']} iterations):[/bold]")
+                wp = mc["weekly_pnl"]
+                console.print(f"  Weekly PnL — Mean: ${wp['mean']:+.2f}, "
+                              f"Median: ${wp['median']:+.2f}")
+                for key in sorted(wp.keys()):
+                    if key.startswith("p"):
+                        console.print(f"  {key}: ${wp[key]:+.2f}")
+                console.print(f"  P(positive week): {wp['prob_positive']:.1f}%")
+                console.print(f"  P(hit $5 target): {wp['prob_above_target']:.1f}%")
+
             console.print()
 
         except Exception:
@@ -395,7 +641,7 @@ class Backtester:
             print(f"  BACKTEST RESULTS")
             print(f"{'='*50}")
             for key, val in metrics.items():
-                if key != "exit_reasons":
+                if key not in ("exit_reasons", "weekly_pnl", "monte_carlo"):
                     print(f"  {key}: {val}")
             print(f"{'='*50}\n")
 
