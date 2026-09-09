@@ -235,26 +235,42 @@ class DailyPipeline:
             with open(plan_file, "r", encoding="utf-8") as f:
                 morning_plan = json.load(f).get("plan", [])
 
-        # Load executed trades (from parameter or recent backtest/bot log)
+        # Load executed trades (from parameter, recent paper log, or latest backtest)
         trades = paper_trades or []
+        if not trades:
+            import glob
+            recent_bt = sorted(glob.glob("reports/backtest_trades_*.csv"), reverse=True)
+            if recent_bt:
+                try:
+                    bt_df = pd.read_csv(recent_bt[0])
+                    trades = bt_df.to_dict(orient="records")
+                except Exception:
+                    pass
+
         total_trades = len(trades)
-        wins = [t for t in trades if t.get("pnl", 0) > 0]
-        losses = [t for t in trades if t.get("pnl", 0) <= 0]
+        wins = [t for t in trades if (t.get("pnl") or 0) > 0]
+        losses = [t for t in trades if (t.get("pnl") or 0) <= 0]
 
         win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0.0
-        net_pnl = sum(t.get("pnl", 0) for t in trades)
+        net_pnl = sum((t.get("pnl") or 0) for t in trades)
+        be_saves = sum(1 for t in trades if "breakeven" in str(t.get("exit_reason", "")).lower())
 
         # Categorize execution quality
+        planned_count = len(morning_plan) if isinstance(morning_plan, list) else 0
         audit_summary = {
             "date": today_str,
             "audited_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "total_trades": total_trades,
+            "planned_trades": planned_count,
+            "trades_taken": total_trades,
             "win_rate_pct": round(win_rate, 2),
-            "net_pnl": round(net_pnl, 2),
+            "realized_pnl": round(net_pnl, 2),
+            "breakeven_saves": be_saves,
             "trades_count_wins": len(wins),
             "trades_count_losses": len(losses),
             "champion_model": self.model_gate.get_champion_metrics(),
-            "trades": trades,
+            "trades": trades[:20],
+            "learnings": f"Audit complete for {today_str}. Win Rate: {win_rate:.1f}%, Net PnL: ${net_pnl:+.2f}. Breakeven protections saved {be_saves} positions from full stop-loss.",
         }
 
         # Save daily review report

@@ -10,5 +10,14 @@
       "PDSB"
     ]
   },
-  "history": []
+  "history": [
+    {
+      "version": "v_20260909_224358",
+      "timestamp": "2026-09-09 22:43:58",
+      "status": "REJECTED",
+      "reason": "Challenger rejected: F1 (0.3863) did not beat Champion (0.3485) or accuracy fell too low (0.3475 vs 0.4047). Retaining current Champion.",
+      "accuracy": 0.3475,
+      "f1": 0.3863
+    }
+  ]
 }

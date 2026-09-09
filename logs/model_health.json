@@ -1,13 +1,24 @@
 {
-  "overall_status": "POOR \u2014 Model underperforming",
-  "generated_at": "2026-09-03T20:57:17.725450",
-  "total_predictions": 4,
+  "overall_status": "HEALTHY \u2014 Model performing well",
+  "generated_at": "2026-09-09T22:51:06.214479",
+  "total_predictions": 5,
   "rolling_accuracy": {
-    "status": "insufficient_data",
-    "count": 4
+    "status": "ok",
+    "count": 5,
+    "overall_accuracy": 1.0,
+    "buy_accuracy": 1.0,
+    "sell_accuracy": 0,
+    "buy_count": 5,
+    "sell_count": 0,
+    "avg_buy_pnl": 1.5,
+    "avg_sell_pnl": 0
   },
   "model_decay": {
-    "status": "insufficient_data",
+    "status": "healthy",
+    "live_accuracy": 1.0,
+    "training_accuracy": 0.55,
+    "decay_pct": -81.82,
+    "threshold_pct": 10,
     "needs_retrain": false
   },
   "signal_quality": {
