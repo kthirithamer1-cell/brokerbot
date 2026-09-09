@@ -1,0 +1,43 @@
+{
+  "total_trades": 3,
+  "winning_trades": 3,
+  "losing_trades": 0,
+  "win_rate_pct": 100.0,
+  "profit_factor": 2.19,
+  "total_return_pct": 6.93,
+  "total_pnl": 2.19,
+  "initial_capital": 30.0,
+  "final_equity": 32.08,
+  "max_drawdown_pct": -2.46,
+  "sharpe_ratio": 3.12,
+  "avg_win": 0.73,
+  "avg_loss": 0,
+  "avg_trade": 0.73,
+  "avg_win_loss_ratio": 0,
+  "max_win_streak": 3,
+  "max_loss_streak": 0,
+  "long_trades": 1,
+  "short_trades": 2,
+  "exit_reasons": {
+    "Take-profit": 3
+  },
+  "weekly_pnl": {
+    "weeks": [
+      {
+        "year": 2026,
+        "week": 36,
+        "pnl": 2.19,
+        "trades": 3,
+        "wins": 3,
+        "hit_target": "False"
+      }
+    ],
+    "total_weeks": 1,
+    "target_hit_count": 0,
+    "target_hit_rate": 0.0,
+    "weekly_target": 25.0,
+    "avg_weekly_pnl": 2.19,
+    "best_week": 2.19,
+    "worst_week": 2.19
+  }
+}

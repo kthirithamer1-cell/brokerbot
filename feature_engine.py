@@ -72,6 +72,7 @@ class FeatureEngine:
 
         # === VOLUME INDICATORS ===
         self._add_volume_features(feat)
+        feat = feat.copy()
 
         # === PRICE-DERIVED FEATURES ===
         self._add_returns(feat)
@@ -88,21 +89,30 @@ class FeatureEngine:
 
         # === NEW: STATISTICAL FEATURES ===
         self._add_statistical_features(feat)
+        feat = feat.copy()
 
         # === NEW: INTRADAY PATTERN FEATURES ===
         self._add_intraday_features(feat)
 
         # === NEW: MULTI-TIMEFRAME FEATURES ===
         if higher_tf_data:
-            for key, value in higher_tf_data.items():
-                feat[key] = 0.0 if (value is None or (isinstance(value, float) and np.isnan(value))) else float(value)
+            htf_dict = {
+                k: 0.0 if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
+                for k, v in higher_tf_data.items()
+            }
+            for k, val in htf_dict.items():
+                feat[k] = val
 
         # === SENTIMENT FEATURES ===
         if sentiment_features:
-            for key, value in sentiment_features.items():
-                feat[key] = 0.0 if (value is None or pd.isna(value)) else float(value)
+            sent_dict = {
+                k: 0.0 if (v is None or pd.isna(v)) else float(v)
+                for k, v in sentiment_features.items()
+            }
+            for k, val in sent_dict.items():
+                feat[k] = val
 
-        # Defragment DataFrame after multiple column additions
+        # Defragment DataFrame after all column additions
         feat = feat.copy()
 
         # Replace infinite values with NaN before dropping

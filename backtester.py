@@ -45,7 +45,7 @@ class Backtester:
         self.initial_capital = bt_cfg.get("initial_capital", 100_000)
         self.commission_per_share = bt_cfg.get("commission_per_share", 0.005)
         self.slippage_pct = bt_cfg.get("slippage_pct", 0.05) / 100
-        self.enable_shorts = bt_cfg.get("enable_shorts", True)
+        self.enable_shorts = bt_cfg.get("enable_shorts", False)
         self.monte_carlo_iterations = bt_cfg.get("monte_carlo_iterations", 1000)
         self.monte_carlo_confidence = bt_cfg.get("monte_carlo_confidence", 0.95)
 
@@ -54,6 +54,9 @@ class Backtester:
         self.max_position_pct = risk_cfg.get("max_position_pct", 5.0) / 100
         self.stop_loss_atr_mult = risk_cfg.get("stop_loss_atr_mult", 2.0)
         self.take_profit_atr_mult = risk_cfg.get("take_profit_atr_mult", 3.0)
+        self.enable_breakeven_stop = risk_cfg.get("enable_breakeven_stop", True)
+        self.breakeven_atr_mult = risk_cfg.get("breakeven_atr_mult", 1.0)
+        self.trailing_stop = risk_cfg.get("trailing_stop", True)
 
         self.report_dir = Path("reports")
         self.report_dir.mkdir(exist_ok=True)
@@ -85,6 +88,12 @@ class Backtester:
         df["signal"] = signals["signal"].reindex(df.index).fillna(0).astype(int)
         if "confidence" in signals.columns:
             df["confidence"] = signals["confidence"].reindex(df.index).fillna(0)
+
+        # Merge key confirmation features if provided
+        if features is not None:
+            for col in ["close_vs_vwap", "close_vs_ema_21", "ema_21_50_cross", "rsi_14", "volume_ratio_sma20"]:
+                if col in features.columns:
+                    df[col] = features[col].reindex(df.index)
 
         # Compute ATR for stop placement
         df["atr"] = self._compute_atr(df)
@@ -130,6 +139,30 @@ class Backtester:
 
             # ── Check exit conditions for open position ──
             if position is not None:
+                # Dynamic Breakeven & Trailing Stop Updates
+                if position["type"] == "long":
+                    # Breakeven: once price hits entry + 1R, protect capital
+                    if self.enable_breakeven_stop and row["High"] >= position["entry_price"] + atr * self.breakeven_atr_mult:
+                        be_price = position["entry_price"] * (1 + self.slippage_pct + 0.001)
+                        if be_price > position["stop_loss"]:
+                            position["stop_loss"] = be_price
+
+                    # Trailing stop
+                    if self.trailing_stop:
+                        trail_price = row["High"] - (atr * self.stop_loss_atr_mult)
+                        if trail_price > position["stop_loss"]:
+                            position["stop_loss"] = trail_price
+                elif position["type"] == "short":
+                    if self.enable_breakeven_stop and row["Low"] <= position["entry_price"] - atr * self.breakeven_atr_mult:
+                        be_price = position["entry_price"] * (1 - self.slippage_pct - 0.001)
+                        if be_price < position["stop_loss"]:
+                            position["stop_loss"] = be_price
+
+                    if self.trailing_stop:
+                        trail_price = row["Low"] + (atr * self.stop_loss_atr_mult)
+                        if trail_price < position["stop_loss"]:
+                            position["stop_loss"] = trail_price
+
                 exit_price = None
                 exit_reason = None
 
@@ -137,7 +170,7 @@ class Backtester:
                     # Stop-loss hit (intrabar check using Low)
                     if row["Low"] <= position["stop_loss"]:
                         exit_price = position["stop_loss"]
-                        exit_reason = "Stop-loss"
+                        exit_reason = "Stop-loss (Breakeven/Trailing)" if position["stop_loss"] >= position["entry_price"] else "Stop-loss"
                     # Take-profit hit (intrabar check using High)
                     elif row["High"] >= position["take_profit"]:
                         exit_price = position["take_profit"]
@@ -201,8 +234,14 @@ class Backtester:
 
             # ── Check entry conditions ──
             if position is None:
+                # Filter: reject long if price is severely lagging session VWAP (deep selloff)
+                allow_buy = True
+                if "close_vs_vwap" in row and pd.notna(row["close_vs_vwap"]):
+                    if row["close_vs_vwap"] < -0.03:
+                        allow_buy = False
+
                 # LONG entry
-                if signal == 1:
+                if signal == 1 and allow_buy:
                     position = self._open_position(
                         "long", price, atr, cash, dt
                     )

@@ -100,8 +100,12 @@ class PennyScanner:
         min_mcap = self.scanner_cfg.get("min_market_cap", 10_000_000)
         max_mcap = self.scanner_cfg.get("max_market_cap", 500_000_000)
 
-        # Get broad universe of tickers
-        symbols = self.data_loader.get_penny_stock_universe()
+        # Get broad universe of tickers (including live trending & active gainers)
+        symbols = self.data_loader.get_penny_stock_universe(
+            max_price=max_price,
+            min_price=min_price,
+            min_volume=min_volume
+        )
 
         candidates = []
         for symbol in symbols:
@@ -132,6 +136,9 @@ class PennyScanner:
         if not candidates:
             return pd.DataFrame()
 
+        # Prioritize top active gainers and cap at 12 to run lean on 4GB RAM
+        candidates = sorted(candidates, key=lambda x: (x.get("change_pct", 0) or 0, x.get("avg_volume", 0) or 0), reverse=True)[:12]
+
         return pd.DataFrame(candidates)
 
     def _score_candidates(
@@ -141,7 +148,7 @@ class PennyScanner:
         scores = []
 
         # Get SPY benchmark data for relative strength
-        spy_data = self.data_loader.fetch_price_data("SPY", period="3mo")
+        spy_data = self.data_loader.fetch_price_data("SPY", period="3mo", interval="1d")
         spy_return_5d = 0.0
         if not spy_data.empty and len(spy_data) >= 5:
             spy_return_5d = (
@@ -291,24 +298,36 @@ class PennyScanner:
         return min(100, max(0, score))
 
     def _compute_sentiment_score(self, symbol: str) -> float:
-        """Compute sentiment score (0–100) from news."""
+        """Compute sentiment score (0–100) from news using fast financial lexicon (low RAM)."""
+        if not self.data_loader.news_api_key:
+            return 50.0  # Instant neutral score without slow network scraping
         try:
-            if self.sentiment_analyzer is None:
-                self.sentiment_analyzer = SentimentAnalyzer()
-
             articles = self.data_loader.fetch_news(symbol, days_back=3)
             if not articles:
                 return 50.0  # Neutral if no news
 
-            scored = self.sentiment_analyzer.score_articles(articles)
+            bullish_words = {
+                "surge", "gain", "soar", "jump", "rally", "profit", "beat", "growth",
+                "buy", "bullish", "approval", "fda", "partner", "contract", "record", "high", "upgrade"
+            }
+            bearish_words = {
+                "drop", "fall", "plunge", "sink", "loss", "miss", "sell", "bearish",
+                "dilution", "warning", "debt", "lawsuit", "investigation", "low", "downgrade"
+            }
 
-            # Average net sentiment
-            positive = np.mean([a["sentiment_positive"] for a in scored])
-            negative = np.mean([a["sentiment_negative"] for a in scored])
-            net = positive - negative  # Range: -1 to +1
+            pos_count = 0
+            neg_count = 0
+            for a in articles:
+                text = (str(a.get("title", "")) + " " + str(a.get("description", ""))).lower()
+                pos_count += sum(1 for w in bullish_words if w in text)
+                neg_count += sum(1 for w in bearish_words if w in text)
 
-            # Map to 0–100
-            return min(100, max(0, 50 + net * 50))
+            total = pos_count + neg_count
+            if total == 0:
+                return 50.0
+
+            net = (pos_count - neg_count) / total
+            return float(min(100.0, max(0.0, 50.0 + net * 50.0)))
 
         except Exception as e:
             logger.debug(f"Sentiment scoring failed for {symbol}: {e}")

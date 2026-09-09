@@ -3,12 +3,19 @@
 # ============================================
 # TARGET: +$5/week on $30 capital (15-minute scalping)
 
+# --- Data Sources ---
+data:
+  price_source: "yahoo"          # "auto" | "alpaca" | "yahoo" — using Yahoo (Alpaca SIP subscription required for penny stocks)
+  alpaca_history_years: 2        # How many years of history to request from Alpaca (max practical: ~5)
+  cache_expiry_hours: 18         # Re-download if cache is older than this
+
 # --- IBKR Connection ---
 ibkr:
   host: "127.0.0.1"
   port: 7497          # 7497 = TWS Paper, 7496 = TWS Live, 4002 = Gateway Paper, 4001 = Gateway Live
   client_id: 1
   account: ""         # Leave empty to auto-detect
+  account_type: "cash" # "cash" or "margin" — enforces cash account rules when set to "cash"
 
 # --- Watchlist: High-Beta Momentum Stocks ---
 watchlist:
@@ -52,9 +59,10 @@ strategy:
   label_threshold_pct: 1.0     # Detect +1.0% intraday breakouts (was 2.5% — too high!)
   label_mode: "atr_relative"   # "fixed" = old static threshold | "atr_relative" = dynamic ATR-based
   label_atr_multiplier: 1.5    # Label BUY when forward return > 1.5 × ATR(14)
-  confidence_threshold: 0.28   # 3-class model rarely exceeds 0.50; 0.28 captures strong signals
+  confidence_threshold: 0.42   # Calibrated to model's actual probability distribution (max ~0.52)
   model_type: "xgboost"
   retrain_interval_days: 7     # Retrain weekly for fast-moving penny stocks
+  use_sentiment_in_training: false # Prevent lookahead leak: don't broadcast recent news backward across historical bars
 
 # --- Model Ensemble Configuration ---
 model:
@@ -65,8 +73,13 @@ model:
     - "catboost"
   feature_selection: true        # Enable automatic feature pruning
   max_features: 30               # Max features to keep after selection
-  purge_gap_bars: 5              # Gap between train/test in walk-forward to prevent label leakage
-  embargo_bars: 3                # Embargo after test set to prevent look-ahead
+  feature_selection_mode: "global" # "global" = select once on dataset | "per_fold" = select per fold
+  purge_gap_bars: 30             # Gap >= label horizon (~26 bars for 15m) to strictly prevent label leakage
+  embargo_bars: 10               # Embargo after test set to prevent look-ahead
+  use_sample_weights: true       # Balance class weights to eliminate SELL bias
+  use_smote: false               # Disabled: prevents synthetic interpolation distortion on time-series data
+  min_probability_gap: 0.12      # Min 12% probability lead over runner-up class to filter indecisive signals
+  confidence_percentile: null    # Disabled by default; uses strategy.confidence_threshold (0.55)
 
 # --- Regime Detection ---
 regime:
@@ -100,12 +113,15 @@ session:
 # --- Risk Management: Tight Scalp Parameters ---
 risk:
   max_risk_per_trade_pct: 3.0  # Risk 3% of capital per trade
-  max_position_pct: 90.0       # Deploy 90% on micro account ($30)
+  max_position_pct: 35.0       # 35% max per position (cash account: leaves room for settlement rotation)
   max_daily_loss_pct: 8.0      # Daily drawdown kill-switch
   max_open_positions: 3        # Focus on top 3 setups
-  stop_loss_atr_mult: 1.5      # Tight 1.5x ATR stop-loss (quick cut)
-  take_profit_atr_mult: 2.5    # Realistic 2.5x ATR profit target
+  stop_loss_atr_mult: 2.0      # Wider 2.0x ATR stop-loss — give penny stocks more room (was 1.5)
+  take_profit_atr_mult: 3.0    # Wider 3.0x ATR profit target — let winners run (was 2.5)
   trailing_stop_pct: 1.5       # Trail 1.5% below high watermark (lock profits fast)
+  # Cash account settlement rules
+  settlement_days: 1           # T+1 settlement for US stocks (since May 2024)
+  max_day_trades_per_5d: 3     # Max round-trip day trades per 5 business days (safety limit)
   # Adaptive stop-loss by regime
   regime_stops:
     trending:
@@ -135,7 +151,7 @@ backtest:
   initial_capital: 30.0        # Match your actual capital
   commission_per_share: 0.005  # IBKR tiered rate
   slippage_pct: 0.05           # 5 basis points slippage estimate
-  enable_shorts: true          # Enable short selling in backtests
+  enable_shorts: false         # Disabled — cash accounts cannot short sell
   monte_carlo_iterations: 1000 # Number of Monte Carlo shuffles
   monte_carlo_confidence: 0.95 # Confidence level for Monte Carlo intervals
 

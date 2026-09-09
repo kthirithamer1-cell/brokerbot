@@ -28,10 +28,11 @@ class RiskManager:
         - Daily max drawdown kill-switch
         - Max open positions limit
         - Max single position exposure
-        - Regime-aware adaptive position sizing (NEW)
-        - Daily profit target & scale-down (NEW)
-        - Time-based stop (NEW)
-        - Correlation-based exposure limit (NEW)
+        - Regime-aware adaptive position sizing
+        - Daily profit target & scale-down
+        - Time-based stop
+        - Correlation-based exposure limit
+        - Cash account enforcement (settlement, no shorts, day-trade limit)
     """
 
     def __init__(self, config_path: str = "config.yaml"):
@@ -80,6 +81,25 @@ class RiskManager:
         self._today = date.today()
         self._current_regime = "medium"  # "trending", "ranging", "volatile", "medium"
         self._position_size_multiplier = 1.0  # Regime-based multiplier
+
+        # ── Cash account enforcement ──
+        ibkr_cfg = self.config.get("ibkr", {})
+        self._is_cash_account = ibkr_cfg.get("account_type", "cash") == "cash"
+        self._settlement_days = risk_cfg.get("settlement_days", 1)  # T+1
+        self._max_day_trades_per_5d = risk_cfg.get("max_day_trades_per_5d", 3)
+
+        # Track settled vs unsettled cash
+        self._settled_cash = 0.0          # Available settled cash from IBKR
+        self._buying_power = 0.0          # Buying power from IBKR
+
+        # Day-trade tracking: list of dates when round-trip day trades occurred
+        self._day_trade_dates = []        # [(date, symbol), ...]
+
+        # Settlement tracking: pending settlements from recent sells
+        self._pending_settlements = []    # [{"amount": $, "settles_on": date, "symbol": str}, ...]
+
+        if self._is_cash_account:
+            logger.info("🏦 Cash account mode ACTIVE — shorts blocked, settlement enforced")
 
     def update_equity(self, equity: float):
         """Update current equity. Resets daily tracking on new day."""
@@ -163,6 +183,15 @@ class RiskManager:
         # Max open positions check
         if len(self.open_positions) >= self.max_open_positions:
             return False, f"Max open positions ({self.max_open_positions}) reached"
+
+        # Cash account: day-trade limit check
+        if self._is_cash_account:
+            recent_day_trades = self._count_recent_day_trades()
+            if recent_day_trades >= self._max_day_trades_per_5d:
+                return False, (
+                    f"Day-trade limit reached: {recent_day_trades}/{self._max_day_trades_per_5d} "
+                    f"round-trips in last 5 business days (cash account safety)"
+                )
 
         # Check session timing
         now = datetime.now()
@@ -271,6 +300,7 @@ class RiskManager:
             "stop_loss_price": stop_loss_price,
             "size_multiplier": round(size_multiplier, 2),
             "regime": self._current_regime,
+            "cash_account": self._is_cash_account,
         }
 
     def compute_bracket_levels(
@@ -328,12 +358,15 @@ class RiskManager:
         entry_price: float,
         stop_loss: float,
         shares: int,
+        direction: int = 1,
     ) -> tuple[bool, str]:
         """
         Validate a trade before execution.
 
         Checks:
             - Trading allowed (kill switch + profit target)
+            - Cash account: block short selling
+            - Cash account: buying power / settled cash check
             - Position size limits
             - Duplicate position check
             - Risk/reward minimum
@@ -344,6 +377,10 @@ class RiskManager:
         allowed, reason = self.is_trading_allowed()
         if not allowed:
             return False, reason
+
+        # ── Cash account: block short selling ──
+        if self._is_cash_account and direction == -1:
+            return False, "Short selling is NOT allowed on cash accounts"
 
         # Check duplicate position
         if symbol in self.open_positions:
@@ -357,6 +394,21 @@ class RiskManager:
                 return False, (
                     f"Position {position_pct*100:.1f}% exceeds "
                     f"max {self.max_position_pct*100:.1f}%"
+                )
+
+        # ── Cash account: buying power / settled cash check ──
+        if self._is_cash_account and self._buying_power > 0:
+            if dollar_amount > self._buying_power:
+                return False, (
+                    f"Order ${dollar_amount:.2f} exceeds buying power "
+                    f"${self._buying_power:.2f} (settled cash)"
+                )
+
+        if self._is_cash_account and self._settled_cash > 0:
+            if dollar_amount > self._settled_cash:
+                return False, (
+                    f"Order ${dollar_amount:.2f} exceeds settled cash "
+                    f"${self._settled_cash:.2f} (unsettled funds excluded)"
                 )
 
         # Check minimum shares
@@ -428,6 +480,32 @@ class RiskManager:
             f"{emoji} {pos_type} position closed: {symbol} | "
             f"PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%) | {reason}"
         )
+
+        # ── Cash account: track day trades ──
+        if self._is_cash_account:
+            opened_date = pos.get("opened_at", "")[:10]  # "YYYY-MM-DD"
+            closed_date = datetime.now().strftime("%Y-%m-%d")
+            if opened_date == closed_date:
+                self._day_trade_dates.append((date.today(), symbol))
+                count = self._count_recent_day_trades()
+                logger.warning(
+                    f"⚠️ Day trade detected: {symbol} opened and closed same day "
+                    f"({count}/{self._max_day_trades_per_5d} used in last 5 days)"
+                )
+
+        # ── Cash account: track pending settlement ──
+        if self._is_cash_account:
+            settle_date = self._compute_settlement_date(date.today(), self._settlement_days)
+            sale_proceeds = exit_price * pos["shares"]
+            self._pending_settlements.append({
+                "amount": round(sale_proceeds, 2),
+                "settles_on": settle_date,
+                "symbol": symbol,
+                "trade_date": date.today(),
+            })
+            logger.info(
+                f"   📅 Sale proceeds ${sale_proceeds:.2f} settle on {settle_date.isoformat()}"
+            )
 
         # Log daily progress toward target
         progress = (self.daily_pnl / self.daily_profit_target * 100) if self.daily_profit_target > 0 else 0
@@ -538,7 +616,7 @@ class RiskManager:
         """Get daily trading summary with target progress."""
         progress = (self.daily_pnl / self.daily_profit_target * 100) if self.daily_profit_target > 0 else 0
 
-        return {
+        summary = {
             "date": self._today.isoformat(),
             "start_equity": round(self.start_of_day_equity, 2),
             "current_equity": round(self.current_equity, 2),
@@ -559,6 +637,107 @@ class RiskManager:
             "kill_switch": self._killed,
             "kill_reason": self._kill_reason,
         }
+
+        # Cash account extras
+        if self._is_cash_account:
+            summary["account_type"] = "cash"
+            summary["settled_cash"] = round(self._settled_cash, 2)
+            summary["buying_power"] = round(self._buying_power, 2)
+            summary["day_trades_used"] = self._count_recent_day_trades()
+            summary["day_trades_limit"] = self._max_day_trades_per_5d
+            summary["pending_settlements"] = len([
+                s for s in self._pending_settlements
+                if s["settles_on"] > date.today()
+            ])
+
+        return summary
+
+    # ──────────────────────────────────────────────
+    #  CASH ACCOUNT HELPERS
+    # ──────────────────────────────────────────────
+
+    def update_cash_info(self, settled_cash: float, buying_power: float):
+        """
+        Update settled cash and buying power from IBKR.
+        Called by the bot before each trading cycle.
+
+        Args:
+            settled_cash: Settled cash from IBKR (excludes unsettled proceeds)
+            buying_power: Available buying power from IBKR
+        """
+        self._settled_cash = settled_cash
+        self._buying_power = buying_power
+
+        # Clean up expired settlements
+        today = date.today()
+        self._pending_settlements = [
+            s for s in self._pending_settlements
+            if s["settles_on"] > today
+        ]
+
+        if self._is_cash_account:
+            logger.debug(
+                f"Cash info updated: settled=${settled_cash:.2f}, "
+                f"buying_power=${buying_power:.2f}, "
+                f"pending_settlements={len(self._pending_settlements)}"
+            )
+
+    def _count_recent_day_trades(self) -> int:
+        """
+        Count round-trip day trades in the last 5 business days.
+
+        Returns:
+            Number of day trades in the rolling 5-day window
+        """
+        if not self._day_trade_dates:
+            return 0
+
+        today = date.today()
+        # Count back 5 business days (approx 7 calendar days)
+        cutoff = today - pd.tseries.offsets.BDay(5)
+        cutoff_date = cutoff.date() if hasattr(cutoff, 'date') else cutoff
+
+        return sum(1 for dt, _ in self._day_trade_dates if dt >= cutoff_date)
+
+    @staticmethod
+    def _compute_settlement_date(trade_date: date, settlement_days: int = 1) -> date:
+        """
+        Compute settlement date skipping weekends.
+
+        T+1 means the trade settles 1 business day after the trade date.
+
+        Args:
+            trade_date: The date the trade was executed
+            settlement_days: Number of business days for settlement (default: 1)
+
+        Returns:
+            The settlement date
+        """
+        settle = trade_date
+        days_added = 0
+        while days_added < settlement_days:
+            settle += pd.Timedelta(days=1)
+            # Skip weekends (5=Saturday, 6=Sunday)
+            if settle.weekday() < 5:
+                days_added += 1
+        return settle
+
+    def get_unsettled_amount(self) -> float:
+        """
+        Get total unsettled proceeds from recent sales.
+
+        Returns:
+            Dollar amount of pending settlements
+        """
+        today = date.today()
+        return sum(
+            s["amount"] for s in self._pending_settlements
+            if s["settles_on"] > today
+        )
+
+    def is_cash_account(self) -> bool:
+        """Check if running in cash account mode."""
+        return self._is_cash_account
 
     def get_weekly_summary(self) -> dict:
         """Get weekly P&L summary from trade log."""
@@ -613,7 +792,20 @@ if __name__ == "__main__":
 
     # Test trade validation
     valid, reason = rm.validate_trade("ABCD", 2.50, 2.30, sizing["shares"])
-    print(f"\nTrade valid: {valid} — {reason}")
+    print(f"\nTrade valid (long): {valid} — {reason}")
+
+    # Test cash account: short selling blocked
+    valid_short, reason_short = rm.validate_trade("ABCD", 2.50, 2.70, 10, direction=-1)
+    print(f"\nTrade valid (short): {valid_short} — {reason_short}")
+
+    # Test cash account: buying power check
+    rm.update_cash_info(settled_cash=25.0, buying_power=25.0)
+    valid_cash, reason_cash = rm.validate_trade("XYZ", 5.00, 4.50, 10)  # $50 > $25
+    print(f"\nTrade valid (exceeds settled cash): {valid_cash} — {reason_cash}")
+
+    # Test settlement date
+    settle = rm._compute_settlement_date(date(2024, 1, 5), 1)  # Friday -> Monday
+    print(f"\nSettlement date (T+1 from Friday): {settle}")
 
     # Test daily summary
     summary = rm.get_daily_summary()

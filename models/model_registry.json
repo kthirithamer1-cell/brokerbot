@@ -1,0 +1,14 @@
+{
+  "champion": {
+    "version": "initial_baseline",
+    "accuracy": 0.4047,
+    "f1": 0.3485,
+    "trials_completed": 200,
+    "approved_at": "2026-09-09 22:23:43",
+    "status": "APPROVED",
+    "symbols": [
+      "PDSB"
+    ]
+  },
+  "history": []
+}

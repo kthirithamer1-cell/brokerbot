@@ -71,8 +71,13 @@ class MLModel:
         self.base_model_types = model_cfg.get("base_models", ["xgboost", "lightgbm"])
         self.enable_feature_selection = model_cfg.get("feature_selection", True)
         self.max_features = model_cfg.get("max_features", 30)
-        self.purge_gap = model_cfg.get("purge_gap_bars", 5)
-        self.embargo_bars = model_cfg.get("embargo_bars", 3)
+        self.feature_selection_mode = model_cfg.get("feature_selection_mode", "global")
+        self.purge_gap = model_cfg.get("purge_gap_bars", 30)
+        self.embargo_bars = model_cfg.get("embargo_bars", 10)
+        self.use_sample_weights = model_cfg.get("use_sample_weights", True)
+        self.use_smote = model_cfg.get("use_smote", False)
+        self.min_probability_gap = model_cfg.get("min_probability_gap", 0.12)
+        self.confidence_percentile = model_cfg.get("confidence_percentile", None)
 
         # Adaptive confidence tracking
         self._prediction_log = []  # List of (predicted, actual, confidence) tuples
@@ -233,7 +238,7 @@ class MLModel:
     #  FEATURE SELECTION
     # ──────────────────────────────────────────────
 
-    def _select_features(self, X: pd.DataFrame, y: np.ndarray) -> pd.DataFrame:
+    def _select_features(self, X: pd.DataFrame, y: np.ndarray, force_refit: bool = False) -> pd.DataFrame:
         """
         Select top features using importance-based pruning.
 
@@ -243,6 +248,12 @@ class MLModel:
         if not self.enable_feature_selection or len(X.columns) <= self.max_features:
             self.selected_features = list(X.columns)
             return X
+
+        # In global mode, if features already selected and valid, reuse them
+        if not force_refit and getattr(self, "feature_selection_mode", "global") == "global" and self.selected_features:
+            valid_feats = [f for f in self.selected_features if f in X.columns]
+            if len(valid_feats) == len(self.selected_features):
+                return X[valid_feats]
 
         logger.info(f"Feature selection: {len(X.columns)} → max {self.max_features}")
 
@@ -307,17 +318,48 @@ class MLModel:
         # Encode labels: -1, 0, 1 → 0, 1, 2
         y_encoded = self.label_encoder.fit_transform(y)
 
-        # Feature selection
-        X_selected = self._select_features(X, y_encoded)
+        # Feature selection (force fresh selection on full dataset)
+        X_selected = self._select_features(X, y_encoded, force_refit=True)
+
+        # SMOTE oversampling for minority classes
+        X_fit, y_fit = X_selected, y_encoded
+        if getattr(self, "use_smote", True):
+            try:
+                from imblearn.over_sampling import SMOTE
+                counts = pd.Series(y_encoded).value_counts()
+                if counts.min() > 5:
+                    k_neighbors = min(5, counts.min() - 1)
+                    smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+                    X_fit, y_fit = smote.fit_resample(X_selected, y_encoded)
+                    logger.info(f"SMOTE applied: {len(X_selected)} → {len(X_fit)} samples (balanced across all classes)")
+            except Exception as e:
+                logger.warning(f"SMOTE skipped: {e}")
+
+        # Compute balanced sample weights
+        sample_weights = None
+        if getattr(self, "use_sample_weights", True):
+            from sklearn.utils.class_weight import compute_sample_weight
+            sample_weights = compute_sample_weight("balanced", y_fit)
+            logger.info("Using balanced class weights for training")
 
         self._create_model(params)
-        self.model.fit(X_selected, y_encoded)
+        
+        # Fit model
+        if sample_weights is not None:
+            try:
+                self.model.fit(X_fit, y_fit, sample_weight=sample_weights)
+            except Exception as e:
+                logger.warning(f"Fitting with sample_weight failed ({e}), falling back to standard fit")
+                self.model.fit(X_fit, y_fit)
+        else:
+            self.model.fit(X_fit, y_fit)
 
-        # Training accuracy
+        # Training accuracy on original real data
         y_pred = self.model.predict(X_selected)
         train_acc = accuracy_score(y_encoded, y_pred)
         train_f1 = f1_score(y_encoded, y_pred, average="weighted", zero_division=0)
 
+        existing_wf = self.training_metrics.get("walk_forward")
         self.training_metrics = {
             "train_accuracy": round(train_acc, 4),
             "train_f1": round(train_f1, 4),
@@ -329,6 +371,8 @@ class MLModel:
             "label_distribution": dict(pd.Series(y).value_counts().to_dict()),
             "trained_at": datetime.now().isoformat(),
         }
+        if existing_wf:
+            self.training_metrics["walk_forward"] = existing_wf
 
         logger.info(f"Training accuracy: {train_acc:.4f}, F1: {train_f1:.4f}")
         if self.selected_features:
@@ -346,6 +390,8 @@ class MLModel:
         n_splits: int = 5,
         min_train_size: int = 252,  # ~1 year of daily bars
         params: dict | None = None,
+        purge_gap: int | None = None,
+        embargo: int | None = None,
     ) -> dict:
         """
         Walk-forward (expanding window) cross-validation with purge gap.
@@ -359,12 +405,17 @@ class MLModel:
             n_splits: Number of walk-forward splits
             min_train_size: Minimum training window size
             params: Model hyperparameters
+            purge_gap: Gap in bars between train and test (>= label horizon)
+            embargo: Gap in bars after test set
 
         Returns:
             Dict with per-fold and aggregate metrics
         """
+        effective_purge = purge_gap if purge_gap is not None else max(self.purge_gap, 26)
+        effective_embargo = embargo if embargo is not None else max(self.embargo_bars, 10)
+
         logger.info(f"Walk-forward validation: {n_splits} splits, min_train={min_train_size}, "
-                     f"purge_gap={self.purge_gap}, embargo={self.embargo_bars}")
+                     f"purge_gap={effective_purge}, embargo={effective_embargo}")
 
         self.feature_names = list(X.columns)
         total_size = len(X)
@@ -382,8 +433,8 @@ class MLModel:
         for fold in range(n_splits):
             train_end = min_train_size + fold * step_size
 
-            # Apply purge gap: skip `purge_gap` bars between train and test
-            test_start = train_end + self.purge_gap
+            # Apply purge gap: skip `effective_purge` bars between train and test to prevent label leakage
+            test_start = train_end + effective_purge
             test_end = min(test_start + step_size, total_size)
 
             # Apply embargo: skip `embargo_bars` after each test set
@@ -405,13 +456,37 @@ class MLModel:
             y_train_enc = le.fit_transform(y_train)
             y_test_enc = le.transform(y_test)
 
-            # Feature selection on training set only
-            X_train_sel = self._select_features(X_train, y_train_enc)
+            # Feature selection
+            X_train_sel = self._select_features(X_train, y_train_enc, force_refit=(fold == 0))
             X_test_sel = X_test[self.selected_features] if self.selected_features else X_test
+
+            # Apply SMOTE & sample weights inside fold
+            X_fit_fold, y_fit_fold = X_train_sel, y_train_enc
+            if getattr(self, "use_smote", True):
+                try:
+                    from imblearn.over_sampling import SMOTE
+                    counts = pd.Series(y_train_enc).value_counts()
+                    if counts.min() > 5:
+                        k_neighbors = min(5, counts.min() - 1)
+                        smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+                        X_fit_fold, y_fit_fold = smote.fit_resample(X_train_sel, y_train_enc)
+                except Exception:
+                    pass
+
+            sample_weights_fold = None
+            if getattr(self, "use_sample_weights", True):
+                from sklearn.utils.class_weight import compute_sample_weight
+                sample_weights_fold = compute_sample_weight("balanced", y_fit_fold)
 
             # Train
             self._create_model(params)
-            self.model.fit(X_train_sel, y_train_enc)
+            if sample_weights_fold is not None:
+                try:
+                    self.model.fit(X_fit_fold, y_fit_fold, sample_weight=sample_weights_fold)
+                except Exception:
+                    self.model.fit(X_fit_fold, y_fit_fold)
+            else:
+                self.model.fit(X_fit_fold, y_fit_fold)
 
             # Predict
             y_pred_enc = self.model.predict(X_test_sel)
@@ -473,8 +548,8 @@ class MLModel:
 
         results = {
             "n_splits": n_splits,
-            "purge_gap_bars": self.purge_gap,
-            "embargo_bars": self.embargo_bars,
+            "purge_gap_bars": effective_purge,
+            "embargo_bars": effective_embargo,
             "overall_accuracy": round(overall_acc, 4),
             "overall_f1": round(overall_f1, 4),
             "buy_signal_win_rate": round(win_rate, 4),
@@ -484,8 +559,8 @@ class MLModel:
             ),
         }
 
-        self.training_metrics = results
-        logger.info(f"Overall: acc={overall_acc:.4f}, f1={overall_f1:.4f}, "
+        self.training_metrics["walk_forward"] = results
+        logger.info(f"Walk-forward results: acc={overall_acc:.4f}, f1={overall_f1:.4f}, "
                      f"buy_win_rate={win_rate:.4f}")
         return results
 
@@ -497,19 +572,32 @@ class MLModel:
         self,
         X: pd.DataFrame,
         y: pd.Series,
-        n_trials: int = 50,
+        n_trials: int = 30,
         n_splits: int = 3,
+        study_name: str = "ibkr_penny_study",
     ) -> dict:
         """
         Tune hyperparameters using Optuna with walk-forward validation.
+        Persists trials in SQLite db (models/optuna_study.db) so tuning accumulates across days.
 
         Returns:
-            Best parameters dict
+            Dict with best parameters, best F1 score, and total trials count
         """
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        logger.info(f"Starting Optuna tuning: {n_trials} trials")
+        db_path = (self.model_dir / "optuna_study.db").resolve()
+        storage_url = f"sqlite:///{db_path}"
+
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage_url,
+            load_if_exists=True,
+            direction="maximize",
+        )
+        existing_trials = len(study.trials)
+        logger.info(f"📊 Persistent Optuna study '{study_name}' loaded ({existing_trials} prior trials)")
+        logger.info(f"🚀 Running {n_trials} additional tuning trials...")
 
         # Save original ensemble method and temporarily switch to single for speed
         original_ensemble = self.ensemble_method
@@ -518,32 +606,37 @@ class MLModel:
         def objective(trial):
             if self.model_type == "xgboost":
                 params = {
-                    "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
-                    "max_depth": trial.suggest_int("max_depth", 3, 10),
-                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "n_estimators": trial.suggest_int("n_estimators", 80, 400),
+                    "max_depth": trial.suggest_int("max_depth", 3, 8),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.25, log=True),
                     "subsample": trial.suggest_float("subsample", 0.6, 1.0),
                     "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-                    "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+                    "min_child_weight": trial.suggest_int("min_child_weight", 1, 15),
                     "reg_alpha": trial.suggest_float("reg_alpha", 0.001, 10.0, log=True),
                     "reg_lambda": trial.suggest_float("reg_lambda", 0.001, 10.0, log=True),
+                    "n_jobs": 2,
                 }
             elif self.model_type == "lightgbm":
                 params = {
-                    "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
-                    "max_depth": trial.suggest_int("max_depth", 3, 10),
-                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "n_estimators": trial.suggest_int("n_estimators", 80, 400),
+                    "max_depth": trial.suggest_int("max_depth", 3, 8),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.25, log=True),
                     "subsample": trial.suggest_float("subsample", 0.6, 1.0),
                     "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
                     "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
                     "reg_alpha": trial.suggest_float("reg_alpha", 0.001, 10.0, log=True),
                     "reg_lambda": trial.suggest_float("reg_lambda", 0.001, 10.0, log=True),
+                    "n_jobs": 2,
+                    "verbose": -1,
                 }
             elif self.model_type == "catboost":
                 params = {
-                    "iterations": trial.suggest_int("iterations", 100, 1000),
-                    "depth": trial.suggest_int("depth", 3, 10),
-                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "iterations": trial.suggest_int("iterations", 80, 400),
+                    "depth": trial.suggest_int("depth", 3, 8),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.25, log=True),
                     "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.1, 10.0, log=True),
+                    "thread_count": 2,
+                    "verbose": False,
                 }
             else:
                 params = {}
@@ -551,20 +644,21 @@ class MLModel:
             result = self.walk_forward_validate(X, y, n_splits=n_splits, params=params)
             return result.get("overall_f1", 0.0)
 
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
         best_params = study.best_params
         best_score = study.best_value
+        total_trials = len(study.trials)
 
-        logger.info(f"Best F1 score: {best_score:.4f}")
-        logger.info(f"Best params: {best_params}")
+        logger.info(f"🏆 Total cumulative trials across all runs: {total_trials}")
+        logger.info(f"🏆 Best F1 score found: {best_score:.4f}")
+        logger.info(f"🏆 Best params: {best_params}")
 
         # Restore ensemble method and re-train with best params on full data
         self.ensemble_method = original_ensemble
         self.train(X, y, params=best_params)
 
-        return {"best_params": best_params, "best_f1": best_score}
+        return {"best_params": best_params, "best_f1": best_score, "total_trials": total_trials}
 
     # ──────────────────────────────────────────────
     #  PREDICTION
@@ -623,17 +717,32 @@ class MLModel:
         results["raw_signal"] = y_pred
         results["confidence"] = np.max(y_prob, axis=1)
 
+        # Calculate probability gap between highest and second-highest class
+        sorted_probs = np.sort(y_prob, axis=1)
+        results["prob_gap"] = sorted_probs[:, -1] - sorted_probs[:, -2]
+
         # Use adaptive threshold if available, otherwise use provided threshold
         effective_threshold = self.get_adaptive_threshold() or confidence_threshold
 
-        # Apply confidence threshold
-        results["signal"] = results.apply(
-            lambda row: row["raw_signal"]
-            if row["confidence"] >= effective_threshold
-            else 0,
-            axis=1,
-        )
+        # If confidence_percentile is configured and valid, compute dynamic percentile cutoff
+        conf_percentile = getattr(self, "confidence_percentile", None)
+        if conf_percentile is not None and conf_percentile > 0 and len(results) >= 20:
+            pct_val = float(np.percentile(results["confidence"], conf_percentile))
+            effective_threshold = max(effective_threshold, pct_val)
 
+        min_gap = getattr(self, "min_probability_gap", 0.04)
+        if min_gap is None:
+            min_gap = 0.04
+
+        # Filter signals: require BOTH sufficient confidence AND sufficient probability gap
+        filtered_signals = []
+        for raw_sig, conf, gap in zip(results["raw_signal"], results["confidence"], results["prob_gap"]):
+            if raw_sig != 0 and conf >= effective_threshold and gap >= min_gap:
+                filtered_signals.append(raw_sig)
+            else:
+                filtered_signals.append(0)
+
+        results["signal"] = filtered_signals
         results["effective_threshold"] = effective_threshold
 
         return results
@@ -749,7 +858,8 @@ class MLModel:
             elif hasattr(self.model, "estimators_"):
                 # Voting/Stacking: average importances from base estimators
                 all_importances = []
-                for name, est in self.model.estimators_:
+                for item in self.model.estimators_:
+                    est = item[1] if isinstance(item, (list, tuple)) else item
                     if hasattr(est, "feature_importances_"):
                         all_importances.append(est.feature_importances_)
                 if all_importances:

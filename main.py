@@ -13,6 +13,7 @@ Usage:
 """
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -23,10 +24,10 @@ import yaml
 for d in ["data", "models", "logs", "reports"]:
     Path(d).mkdir(exist_ok=True)
 
-# Setup logging (UTF-8 safe for Windows)
+# Setup logging (UTF-8 safe for Windows with immediate line buffering)
 if hasattr(sys.stdout, "reconfigure"):
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     except Exception:
         pass
 
@@ -54,10 +55,13 @@ def cli(ctx, config):
 @cli.command()
 @click.option("--symbols", default=None, help="Comma-separated symbols (overrides config)")
 @click.option("--years", default=None, type=int, help="Years of historical data")
+@click.option("--period", default=None, help="Historical period (e.g. 60d, 1y, 2y)")
+@click.option("--timeframe", default=None, help="Bar timeframe (e.g. 15m, 1h, 1d)")
 @click.option("--tune", is_flag=True, help="Run hyperparameter tuning with Optuna")
 @click.option("--tune-trials", default=50, type=int, help="Number of Optuna trials")
+@click.option("--source", default=None, type=click.Choice(["alpaca", "yahoo", "auto"]), help="Data source (default: auto)")
 @click.pass_context
-def train(ctx, symbols, years, tune, tune_trials):
+def train(ctx, symbols, years, period, timeframe, tune, tune_trials, source):
     """Train the ML model on historical data + news sentiment."""
     import numpy as np
     import pandas as pd
@@ -78,13 +82,29 @@ def train(ctx, symbols, years, tune, tune_trials):
 
     if years:
         config["strategy"]["lookback_years"] = years
+    if timeframe:
+        config["strategy"]["timeframe"] = timeframe
 
     # Determine training timeframe and period
     train_timeframe = config["strategy"].get("timeframe", "1d")
     train_years = config["strategy"].get("lookback_years", 1)
-    # yfinance caps 15m/5m data at 60 days
-    if train_timeframe in ("15m", "5m"):
-        train_period = "60d"
+
+    # Resolve data source
+    data_cfg = config.get("data", {})
+    effective_source = source or data_cfg.get("price_source", "auto")
+
+    # yfinance caps 15m/5m data at 60 days — Alpaca has no such limit
+    if period:
+        train_period = period
+    elif effective_source in ("alpaca",) or (
+        effective_source == "auto" and os.getenv("ALPACA_API_KEY", "")
+        and os.getenv("ALPACA_API_KEY", "") != "your_alpaca_api_key"
+    ):
+        # Alpaca: use configured history years (no 60d cap)
+        alpaca_years = data_cfg.get("alpaca_history_years", 2)
+        train_period = f"{alpaca_years}y"
+    elif train_timeframe in ("15m", "5m"):
+        train_period = "60d"  # yfinance caps 15m/5m at 60 days
     elif train_timeframe in ("1h", "1H"):
         train_period = "2y"  # yfinance allows up to 2y for 1h
     else:
@@ -102,6 +122,7 @@ def train(ctx, symbols, years, tune, tune_trials):
     logger.info("🧠 TRAINING ML MODEL")
     logger.info(f"   Symbols: {', '.join(symbol_list)}")
     logger.info(f"   Timeframe: {train_timeframe} | Period: {train_period}")
+    logger.info(f"   Data source: {effective_source}")
     logger.info(f"   Model: {config['strategy'].get('model_type', 'xgboost')}")
     logger.info(f"   Ensemble: {ensemble_method}")
     logger.info(f"   Label mode: {label_mode} (ATR mult: {label_atr_mult})")
@@ -120,22 +141,26 @@ def train(ctx, symbols, years, tune, tune_trials):
     for symbol in symbol_list:
         logger.info(f"\n📦 Processing {symbol}...")
 
-        # Fetch price data (use correct timeframe and capped period)
-        df = data_loader.fetch_price_data(symbol, period=train_period, interval=train_timeframe)
+        # Fetch price data (Alpaca: 7+ years | Yahoo: 60d for 15m)
+        df = data_loader.fetch_price_data(symbol, period=train_period, interval=train_timeframe, source=effective_source)
         if df.empty or len(df) < 100:
             logger.warning(f"  Insufficient data for {symbol}, skipping")
             continue
 
-        # Fetch news sentiment
+        # Fetch news sentiment (disabled during training by default to avoid lookahead leakage across historical bars)
         sentiment_features = {}
-        try:
-            articles = data_loader.fetch_news(symbol, days_back=7)
-            if articles:
-                scored = sentiment_analyzer.score_articles(articles)
-                sentiment_features = sentiment_analyzer.compute_aggregate_sentiment(scored)
-                logger.info(f"  📰 Sentiment: {len(articles)} articles scored")
-        except Exception as e:
-            logger.warning(f"  Sentiment failed: {e}")
+        use_sent_train = config.get("strategy", {}).get("use_sentiment_in_training", False)
+        if use_sent_train:
+            try:
+                articles = data_loader.fetch_news(symbol, days_back=7)
+                if articles:
+                    scored = sentiment_analyzer.score_articles(articles)
+                    sentiment_features = sentiment_analyzer.compute_aggregate_sentiment(scored)
+                    logger.info(f"  📰 Sentiment: {len(articles)} articles scored")
+            except Exception as e:
+                logger.warning(f"  Sentiment failed: {e}")
+        else:
+            logger.info("  📰 Sentiment in training: DISABLED (prevents historical lookahead leak)")
 
         # Engineer features (including new microstructure, regime, statistical)
         features = feature_engine.compute_features(df, sentiment_features)
@@ -188,15 +213,22 @@ def train(ctx, symbols, years, tune, tune_trials):
     logger.info(f"\n📊 Combined dataset: {len(X)} samples, {len(X.columns)} features")
     logger.info(f"   Label distribution: {dict(y.value_counts().sort_index().to_dict())}")
 
+    # Determine dynamic purge gap (must be >= label horizon to prevent data leakage)
+    wf_purge_gap = max(horizon_bars, 30)
+
     # Train
     if tune:
         logger.info(f"\n🔧 Hyperparameter tuning ({tune_trials} trials)...")
         result = ml_model.tune_hyperparameters(X, y, n_trials=tune_trials)
         logger.info(f"   Best F1: {result['best_f1']:.4f}")
+        # Run walk-forward validation with tuned params to record honest test metrics
+        logger.info("\n📈 Walk-forward validation (purged with best params)...")
+        wf_results = ml_model.walk_forward_validate(X, y, n_splits=5, params=result.get("best_params"), purge_gap=wf_purge_gap)
+        ml_model.train(X, y, params=result.get("best_params"))
     else:
         # Walk-forward validation first
-        logger.info("\n📈 Walk-forward validation (purged)...")
-        wf_results = ml_model.walk_forward_validate(X, y, n_splits=5)
+        logger.info(f"\n📈 Walk-forward validation (purged: {wf_purge_gap} bars)...")
+        wf_results = ml_model.walk_forward_validate(X, y, n_splits=5, purge_gap=wf_purge_gap)
 
         if "error" not in wf_results:
             logger.info(f"   Walk-forward accuracy: {wf_results['overall_accuracy']:.4f}")
@@ -207,20 +239,37 @@ def train(ctx, symbols, years, tune, tune_trials):
         logger.info(f"\n🏋️ Training {ensemble_method} model on full dataset...")
         ml_model.train(X, y)
 
-    # Save model
-    ml_model.save("trading_model")
-    logger.info("✅ Model saved to models/trading_model.joblib")
+    # Save candidate model first
+    ml_model.save("candidate_model")
 
-    # Feature importance
-    importance = ml_model.get_feature_importance(top_n=15)
-    if not importance.empty:
-        logger.info("\n🏆 Top 15 Features:")
-        for _, row in importance.iterrows():
-            bar = "█" * int(row["importance"] * 100)
-            logger.info(f"   {row['feature']:>30} | {bar} {row['importance']:.4f}")
-
-    # Model health baseline
-    logger.info("\n📊 Model health baseline set from training metrics")
+    # Evaluate candidate via Day-by-Day Model Approval Gate
+    from model_gate import ModelGate
+    gate = ModelGate()
+    cand_metrics = {
+        "accuracy": wf_results.get("overall_accuracy", ml_model.training_metrics.get("train_accuracy", 0.0)),
+        "f1": wf_results.get("overall_f1", ml_model.training_metrics.get("train_f1", 0.0)),
+        "buy_win_rate": wf_results.get("buy_signal_win_rate", 0.0),
+        "trials_completed": result.get("total_trials", 0) if tune else 0,
+        "symbols": symbol_list,
+    }
+    cand_meta = {
+        "model_type": ml_model.model_type,
+        "ensemble_method": ml_model.ensemble_method,
+        "feature_names": ml_model.feature_names,
+        "selected_features": ml_model.selected_features,
+        "training_metrics": cand_metrics,
+        "symbols": symbol_list,
+    }
+    approved, reason = gate.evaluate_and_promote(
+        candidate_model_path=Path("models/candidate_model.joblib"),
+        candidate_metrics=cand_metrics,
+        candidate_meta=cand_meta,
+    )
+    if approved:
+        logger.info(f"🎉 Model passed approval gate: {reason}")
+    else:
+        logger.warning(f"⚠️ Model failed approval gate: {reason}")
+        logger.info("ℹ️ Active Champion model retained for trading safety.")
 
 
 @cli.command()
@@ -230,8 +279,9 @@ def train(ctx, symbols, years, tune, tune_trials):
 @click.option("--interval", default="1h", help="Bar timeframe: 1d, 1h, 15m, 5m (default: 1h)")
 @click.option("--capital", default=None, type=float, help="Initial capital in dollars (e.g. 30)")
 @click.option("--confidence", default=None, type=float, help="Confidence threshold (e.g. 0.35)")
+@click.option("--source", default=None, type=click.Choice(["alpaca", "yahoo", "auto"]), help="Data source (default: auto)")
 @click.pass_context
-def backtest(ctx, symbol, period, days, interval, capital, confidence):
+def backtest(ctx, symbol, period, days, interval, capital, confidence, source):
     """Backtest the trained model on historical data (supports 1 week via --days 7)."""
     import pandas as pd
     from data_loader import DataLoader
@@ -243,8 +293,14 @@ def backtest(ctx, symbol, period, days, interval, capital, confidence):
     config_path = ctx.obj["config"]
 
     time_desc = f"Last {days} days" if days else f"{period} ({interval})"
+    # Resolve data source
+    with open(config_path) as f:
+        _cfg = yaml.safe_load(f)
+    data_cfg = _cfg.get("data", {})
+    effective_source = source or data_cfg.get("price_source", "auto")
+
     logger.info("=" * 60)
-    logger.info(f"BACKTESTING — {symbol} | {time_desc} | Capital: ${capital or 100000:,.2f}")
+    logger.info(f"BACKTESTING — {symbol} | {time_desc} | Capital: ${capital or 100000:,.2f} | Source: {effective_source}")
     logger.info("=" * 60)
 
     data_loader = DataLoader(config_path)
@@ -273,7 +329,13 @@ def backtest(ctx, symbol, period, days, interval, capital, confidence):
             days = 180
 
     # Fetch data (download enough history for indicator warm-up: ADX, 200 EMA)
-    if interval == "1d":
+    # When using Alpaca, we get plenty of history without Yahoo's 60d cap
+    if effective_source in ("alpaca",) or (
+        effective_source == "auto" and data_loader._has_alpaca_keys()
+    ):
+        # Alpaca: use configured history years (no cap needed)
+        fetch_period = period  # period param or default
+    elif interval == "1d":
         fetch_period = "2y"
     elif interval in ("15m", "5m"):
         fetch_period = "60d"     # yfinance caps 15m at 60 days
@@ -282,13 +344,25 @@ def backtest(ctx, symbol, period, days, interval, capital, confidence):
     else:
         fetch_period = period
 
-    df = data_loader.fetch_price_data(symbol, period=fetch_period, interval=interval)
+    df = data_loader.fetch_price_data(symbol, period=fetch_period, interval=interval, source=effective_source)
     if df.empty:
         logger.error(f"❌ No data for {symbol}")
         return
 
+    # Fetch sentiment features if available (matches training pipeline)
+    sentiment_features = {}
+    try:
+        articles = data_loader.fetch_news(symbol, days_back=7)
+        if articles:
+            sentiment_analyzer = SentimentAnalyzer()
+            scored = sentiment_analyzer.score_articles(articles)
+            sentiment_features = sentiment_analyzer.compute_aggregate_sentiment(scored)
+            logger.info(f"   📰 Sentiment: {len(articles)} articles scored for backtest")
+    except Exception as e:
+        logger.debug(f"Sentiment fetch in backtest skipped: {e}")
+
     # Compute features
-    features = feature_engine.compute_features(df)
+    features = feature_engine.compute_features(df, sentiment_features=sentiment_features)
     if features.empty:
         logger.error("❌ Feature computation failed")
         return
@@ -333,10 +407,9 @@ def backtest(ctx, symbol, period, days, interval, capital, confidence):
 
         # Show filtered signal counts too
         filt_counts = signals["signal"].value_counts().to_dict()
-        logger.info(f"   Signals in window: BUY={filt_counts.get(1,0)}, SELL={filt_counts.get(-1,0)}, HOLD={filt_counts.get(0,0)}")
-
-    # Run backtest
-    results = backtester.run(prices, signals)
+    # Run backtest with features for confirmation checks
+    feat_slice = predict_features.loc[prices.index] if not predict_features.empty else None
+    results = backtester.run(prices, signals, features=feat_slice)
 
     logger.info(f"\n✅ Backtest complete — {results['metrics']['total_trades']} trades "
                  f"(Long: {results['metrics'].get('long_trades', '?')}, "
@@ -561,5 +634,84 @@ def info(ctx):
         print(yaml.dump(config, default_flow_style=False))
 
 
+@cli.command()
+@click.option("--port", default=5000, type=int, help="Dashboard port (default: 5000)")
+@click.option("--host", default="127.0.0.1", help="Dashboard host (default: 127.0.0.1)")
+@click.option("--debug", is_flag=True, help="Enable Flask debug mode")
+@click.pass_context
+def dashboard(ctx, port, host, debug):
+    """Launch the web dashboard for model metrics, backtests, and penny picks."""
+    from dashboard import create_app
+    import webbrowser
+
+    config_path = ctx.obj["config"]
+
+    logger.info("=" * 60)
+    logger.info("🖥️  LAUNCHING WEB DASHBOARD")
+    logger.info(f"   URL: http://{host}:{port}")
+    logger.info("   Press Ctrl+C to stop")
+    logger.info("=" * 60)
+
+    app = create_app(config_path)
+
+    # Open browser automatically
+    webbrowser.open(f"http://{host}:{port}")
+
+    app.run(host=host, port=port, debug=debug)
+
+
+@cli.command("daily-plan")
+@click.option("--trials", default=25, type=int, help="Cumulative Optuna tuning trials (default: 25)")
+@click.pass_context
+def daily_plan(ctx, trials):
+    """Run Stage 1: Pre-Market scan, cumulative trial tuning, model approval & trade plan."""
+    from daily_pipeline import DailyPipeline
+    config_path = ctx.obj["config"]
+    pipeline = DailyPipeline(config_path)
+    pipeline.run_pre_market(tune_trials=trials)
+
+
+@cli.command("daily-review")
+@click.pass_context
+def daily_review(ctx):
+    """Run Stage 3: Post-Market trade audit, scorecard & journal feedback."""
+    from daily_pipeline import DailyPipeline
+    config_path = ctx.obj["config"]
+    pipeline = DailyPipeline(config_path)
+    pipeline.run_post_market_review()
+
+
+@cli.command("daily-loop")
+@click.option("--trials", default=25, type=int, help="Daily morning tuning trials (default: 25)")
+@click.pass_context
+def daily_loop(ctx, trials):
+    """Run autonomous 3-stage daily lifecycle (Pre-Market -> Paper Trade -> Post-Market)."""
+    from daily_pipeline import DailyPipeline
+    from bot import TradingBot
+
+    config_path = ctx.obj["config"]
+    pipeline = DailyPipeline(config_path)
+
+    logger.info("🚀 Starting 24-Hour Autonomous Trading & Learning Loop...")
+    # Stage 1: Morning Plan & Tuning
+    pipeline.run_pre_market(tune_trials=trials)
+
+    # Stage 2: Paper Trading Session
+    logger.info("📈 Launching Paper Trading Session...")
+    trades_executed = []
+    try:
+        bot = TradingBot(config_path)
+        bot.start(paper=True)
+        trades_executed = getattr(bot.risk_manager, "trade_log", [])
+    except KeyboardInterrupt:
+        logger.info("⏹️ Trading stopped by user.")
+    except Exception as e:
+        logger.error(f"Trading loop exception: {e}")
+
+    # Stage 3: Evening Audit
+    pipeline.run_post_market_review(paper_trades=trades_executed)
+
+
 if __name__ == "__main__":
     cli()
+

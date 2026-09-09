@@ -10,6 +10,7 @@ Upgraded with:
     - Regime-aware risk parameters
     - Daily P&L target integration
     - Model health monitoring
+    - Cash account enforcement (no shorts, settled cash, day-trade tracking)
 """
 
 import logging
@@ -163,6 +164,16 @@ class TradingBot:
             equity = self.ibkr_client.get_equity()
             self.risk_manager.update_equity(equity)
 
+            # Update cash info for cash account enforcement
+            if self.ibkr_client.is_cash_account():
+                settled_cash = self.ibkr_client.get_settled_cash()
+                buying_power = self.ibkr_client.get_buying_power()
+                self.risk_manager.update_cash_info(settled_cash, buying_power)
+                logger.debug(
+                    f"💵 Cash account: settled=${settled_cash:.2f}, "
+                    f"buying_power=${buying_power:.2f}"
+                )
+
             # Check if trading is allowed
             allowed, reason = self.risk_manager.is_trading_allowed()
             if not allowed:
@@ -189,9 +200,15 @@ class TradingBot:
 
             # Log cycle summary
             summary = self.risk_manager.get_daily_summary()
+            cash_info = ""
+            if summary.get("account_type") == "cash":
+                cash_info = (
+                    f" | Settled: ${summary.get('settled_cash', 0):.2f}"
+                    f" | DayTrades: {summary.get('day_trades_used', 0)}/{summary.get('day_trades_limit', 3)}"
+                )
             logger.info(f"💰 Cycle {cycle} | PnL: ${summary['daily_pnl']:+.2f} "
                          f"({summary['target_progress_pct']:.0f}% of target) | "
-                         f"Positions: {summary['open_positions']}")
+                         f"Positions: {summary['open_positions']}{cash_info}")
 
             # Determine sleep interval based on timeframe
             if self.timeframe == "1d":
@@ -396,11 +413,17 @@ class TradingBot:
                 self._close_position(symbol, current_price, "Flip from Short to Long")
             self._execute_buy(symbol, current_price, atr)
         elif signal == -1:
-            # If we hold a long position, close it first
-            if symbol in self.risk_manager.open_positions and self.risk_manager.open_positions[symbol].get("direction", 1) == 1:
-                self._close_position(symbol, current_price, "Flip from Long to Short")
-            # Open short position
-            self._execute_short(symbol, current_price, atr)
+            # On cash accounts: SELL signal only closes existing longs (no short selling)
+            if self.ibkr_client.is_cash_account():
+                if symbol in self.risk_manager.open_positions and self.risk_manager.open_positions[symbol].get("direction", 1) == 1:
+                    self._close_position(symbol, current_price, "SELL signal (cash account — long exit only)")
+                else:
+                    logger.info(f"  ⏭️ {symbol}: SELL signal skipped — cash account cannot short")
+            else:
+                # Margin account: close long and open short
+                if symbol in self.risk_manager.open_positions and self.risk_manager.open_positions[symbol].get("direction", 1) == 1:
+                    self._close_position(symbol, current_price, "Flip from Long to Short")
+                self._execute_short(symbol, current_price, atr)
 
     def _execute_buy(self, symbol: str, price: float, atr: float):
         """Execute a buy trade with risk management."""
@@ -418,9 +441,9 @@ class TradingBot:
             logger.info(f"  ⏭️ {symbol}: Position too small, skipping")
             return
 
-        # Validate trade
+        # Validate trade (direction=1 for long)
         valid, reason = self.risk_manager.validate_trade(
-            symbol, price, bracket["stop_loss"], sizing["shares"]
+            symbol, price, bracket["stop_loss"], sizing["shares"], direction=1
         )
         if not valid:
             logger.info(f"  ⏭️ {symbol}: {reason}")
@@ -466,9 +489,9 @@ class TradingBot:
             logger.info(f"  ⏭️ {symbol}: Position too small for short, skipping")
             return
 
-        # Validate trade
+        # Validate trade (direction=-1 for short)
         valid, reason = self.risk_manager.validate_trade(
-            symbol, price, bracket["stop_loss"], sizing["shares"]
+            symbol, price, bracket["stop_loss"], sizing["shares"], direction=-1
         )
         if not valid:
             logger.info(f"  ⏭️ {symbol}: {reason}")

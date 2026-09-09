@@ -1,0 +1,2 @@
+symbol,name,price,sector,volume_surge_score,momentum_score,technical_score,sentiment_score,relative_strength_score,total_score,ml_confidence,volume_ratio,return_5d_pct,return_10d_pct,key_catalyst,suggested_stop_loss,suggested_target,rank
+SNDL,SNDL,1.4,Trending Small-Cap,42.4,46.6,70.0,50.0,44.8,50.6,0.0,1.27,-1.41,1.45,Technical breakout,1.29,1.61,1

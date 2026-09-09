@@ -1,8 +1,8 @@
 """
 data_loader.py — Historical Price Data & News Fetcher
 =====================================================
-Fetches OHLCV data from yfinance (or IBKR) and financial news
-headlines from NewsAPI for sentiment analysis.
+Fetches OHLCV data from Alpaca (primary, 7+ years intraday),
+yfinance (fallback / fundamentals / news), or IBKR (live trading).
 """
 
 import os
@@ -32,6 +32,17 @@ class DataLoader:
         self.data_dir.mkdir(exist_ok=True)
         self.news_api_key = os.getenv("NEWS_API_KEY", "")
 
+        # Alpaca credentials (free from https://alpaca.markets)
+        self.alpaca_api_key = os.getenv("ALPACA_API_KEY", "")
+        self.alpaca_api_secret = os.getenv("ALPACA_API_SECRET", "")
+
+        # Data source config
+        data_cfg = self.config.get("data", {})
+        self.default_source = data_cfg.get("price_source", "auto")
+        self.alpaca_history_years = data_cfg.get("alpaca_history_years", 2)
+        self.cache_expiry_hours = data_cfg.get("cache_expiry_hours", 18)
+        self._info_cache = {}
+
     # ──────────────────────────────────────────────
     #  PRICE DATA
     # ──────────────────────────────────────────────
@@ -44,9 +55,13 @@ class DataLoader:
         start: Optional[str] = None,
         end: Optional[str] = None,
         use_cache: bool = True,
+        source: Optional[str] = None,
     ) -> pd.DataFrame:
         """
-        Fetch OHLCV price data for a symbol via yfinance.
+        Fetch OHLCV price data for a symbol.
+
+        Uses Alpaca (7+ years intraday) or Yahoo Finance (60-day intraday cap)
+        depending on the `source` parameter and available API keys.
 
         Args:
             symbol: Ticker symbol (e.g., 'AAPL')
@@ -54,6 +69,194 @@ class DataLoader:
             interval: Bar size ('1d', '1h', '15m', '5m')
             start/end: Date strings for custom range
             use_cache: If True, load from local cache if available
+            source: Data source — 'alpaca', 'yahoo', or 'auto' (default from config)
+
+        Returns:
+            DataFrame with columns: Open, High, Low, Close, Volume
+        """
+        if interval is None:
+            interval = self.config["strategy"].get("timeframe", "1d")
+        if source is None:
+            source = self.default_source
+
+        # Route to the appropriate data source
+        if source == "alpaca":
+            return self._fetch_alpaca(symbol, interval=interval, use_cache=use_cache)
+        elif source == "auto":
+            # Try Alpaca first if API keys are configured
+            if self._has_alpaca_keys():
+                df = self._fetch_alpaca(symbol, interval=interval, use_cache=use_cache)
+                if not df.empty:
+                    return df
+                logger.warning(f"Alpaca fetch failed for {symbol}, falling back to Yahoo Finance")
+            # Fall through to Yahoo — cap period to Yahoo's intraday limits
+            yahoo_period = self._cap_yahoo_period(period, interval)
+            return self._fetch_yahoo(symbol, period=yahoo_period, interval=interval,
+                                     start=start, end=end, use_cache=use_cache)
+        else:  # "yahoo" or anything else
+            return self._fetch_yahoo(symbol, period=period, interval=interval,
+                                     start=start, end=end, use_cache=use_cache)
+
+    def _has_alpaca_keys(self) -> bool:
+        """Check if Alpaca API keys are configured."""
+        return (
+            bool(self.alpaca_api_key)
+            and self.alpaca_api_key != "your_alpaca_api_key"
+            and bool(self.alpaca_api_secret)
+            and self.alpaca_api_secret != "your_alpaca_api_secret"
+        )
+
+    @staticmethod
+    def _cap_yahoo_period(period: str | None, interval: str) -> str | None:
+        """Cap the period to Yahoo Finance's intraday data limits.
+
+        Yahoo enforces:
+            - 15m / 5m: max 60 days
+            - 1h: max 2 years (730 days)
+            - 1d: unlimited
+        """
+        if interval in ("15m", "5m"):
+            return "60d"
+        elif interval in ("1h", "1H"):
+            return "2y"
+        return period
+
+    # ──────────────────────────────────────────────
+    #  ALPACA DATA SOURCE (7+ years intraday)
+    # ──────────────────────────────────────────────
+
+    def _fetch_alpaca(
+        self,
+        symbol: str,
+        interval: str = "15m",
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Fetch OHLCV data from Alpaca Markets (free tier: 7+ years intraday).
+
+        Args:
+            symbol: Ticker symbol
+            interval: Bar size ('1d', '1h', '15m', '5m')
+            use_cache: Use local parquet cache
+
+        Returns:
+            DataFrame with columns: Open, High, Low, Close, Volume
+        """
+        history_years = self.alpaca_history_years
+        cache_tag = f"{history_years}y"
+        cache_file = self.data_dir / f"{symbol}_{interval}_{cache_tag}_alpaca.parquet"
+
+        # Check cache
+        if use_cache and cache_file.exists():
+            mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
+            if datetime.now() - mod_time < timedelta(hours=self.cache_expiry_hours):
+                logger.info(f"Loading cached Alpaca data for {symbol}")
+                return pd.read_parquet(cache_file)
+
+        logger.info(f"Downloading {symbol} from Alpaca | interval={interval} | history={history_years}y")
+
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+            # Map our interval strings to Alpaca TimeFrame
+            timeframe_map = {
+                "1m": TimeFrame(1, TimeFrameUnit.Minute),
+                "5m": TimeFrame(5, TimeFrameUnit.Minute),
+                "15m": TimeFrame(15, TimeFrameUnit.Minute),
+                "30m": TimeFrame(30, TimeFrameUnit.Minute),
+                "1h": TimeFrame(1, TimeFrameUnit.Hour),
+                "1H": TimeFrame(1, TimeFrameUnit.Hour),
+                "1d": TimeFrame(1, TimeFrameUnit.Day),
+                "1D": TimeFrame(1, TimeFrameUnit.Day),
+            }
+
+            tf = timeframe_map.get(interval)
+            if tf is None:
+                logger.error(f"Unsupported interval for Alpaca: {interval}")
+                return pd.DataFrame()
+
+            client = StockHistoricalDataClient(
+                api_key=self.alpaca_api_key,
+                secret_key=self.alpaca_api_secret,
+            )
+
+            # Calculate date range
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(days=history_years * 365)
+
+            request_params = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                start=start_dt,
+                end=end_dt,
+            )
+
+            bars = client.get_stock_bars(request_params)
+            df = bars.df
+
+            if df.empty:
+                logger.warning(f"No Alpaca data returned for {symbol}")
+                return pd.DataFrame()
+
+            # Alpaca returns MultiIndex (symbol, timestamp) — flatten it
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.droplevel("symbol")
+
+            # Normalize column names to match Yahoo format
+            col_map = {
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume",
+            }
+            df.rename(columns=col_map, inplace=True)
+
+            # Keep only OHLCV columns
+            ohlcv_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[ohlcv_cols].copy()
+            df.index.name = "Date"
+            df.dropna(inplace=True)
+
+            # Convert timezone-aware index to timezone-naive (match Yahoo format)
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("America/New_York").tz_localize(None)
+
+            # Cache it
+            df.to_parquet(cache_file)
+            logger.info(f"Cached {len(df)} Alpaca bars for {symbol} ({history_years}y of {interval})")
+            return df
+
+        except ImportError:
+            logger.error("alpaca-py not installed. Run: pip install alpaca-py")
+            return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"Alpaca fetch failed for {symbol}: {e}")
+            return pd.DataFrame()
+
+    # ──────────────────────────────────────────────
+    #  YAHOO FINANCE DATA SOURCE (fallback)
+    # ──────────────────────────────────────────────
+
+    def _fetch_yahoo(
+        self,
+        symbol: str,
+        period: Optional[str] = None,
+        interval: Optional[str] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Fetch OHLCV data from Yahoo Finance (yfinance).
+
+        Note: Intraday data (15m, 5m) is capped at ~60 days by Yahoo.
+
+        Args:
+            symbol: Ticker symbol
+            period: yfinance period string
+            interval: Bar size
+            start/end: Date strings for custom range
+            use_cache: Use local parquet cache
 
         Returns:
             DataFrame with columns: Open, High, Low, Close, Volume
@@ -66,23 +269,24 @@ class DataLoader:
 
         cache_file = self.data_dir / f"{symbol}_{interval}_{period or 'custom'}.parquet"
 
-        # Check cache (< 1 day old)
+        # Check cache
         if use_cache and cache_file.exists():
             mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
-            if datetime.now() - mod_time < timedelta(hours=18):
+            if datetime.now() - mod_time < timedelta(hours=self.cache_expiry_hours):
                 logger.info(f"Loading cached data for {symbol}")
                 return pd.read_parquet(cache_file)
 
-        logger.info(f"Downloading {symbol} | interval={interval} | period={period}")
+        logger.info(f"Downloading {symbol} from Yahoo | interval={interval} | period={period}")
         try:
             ticker = yf.Ticker(symbol)
             if start and end:
                 df = ticker.history(start=start, end=end, interval=interval)
             else:
                 df = ticker.history(period=period, interval=interval)
-                # If 5y is empty (common for penny stocks/recent IPOs/SPACs), fallback to shorter periods
-                if df.empty and period not in ("2y", "1y", "6mo", "max"):
-                    for fallback in ["2y", "1y", "6mo", "max"]:
+                # If period is empty (e.g. recent IPO or intraday limit), fallback gracefully
+                if df.empty:
+                    fallbacks = ["30d", "14d", "5d"] if interval in ("1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h") else ["2y", "1y", "6mo", "max"]
+                    for fallback in fallbacks:
                         logger.info(f"Retrying {symbol} with fallback period={fallback}")
                         df = ticker.history(period=fallback, interval=interval)
                         if not df.empty:
@@ -120,70 +324,94 @@ class DataLoader:
     # ──────────────────────────────────────────────
 
     def fetch_stock_info(self, symbol: str) -> dict:
-        """Fetch basic stock info (price, volume, market cap, exchange)."""
+        """Fetch basic stock info (price, volume, market cap, exchange) ultra-fast via fast_info."""
+        if symbol in self._info_cache:
+            return self._info_cache[symbol]
         try:
             ticker = yf.Ticker(symbol)
-            info = ticker.info
-            return {
+            fi = ticker.fast_info
+            price = float(getattr(fi, "last_price", 0.0) or getattr(fi, "previous_close", 0.0) or 0.0)
+            avg_vol = float(getattr(fi, "three_month_average_volume", 0) or getattr(fi, "ten_day_average_volume", 0) or 0)
+            mcap = float(getattr(fi, "market_cap", 0) or 0)
+            info = {
                 "symbol": symbol,
-                "price": info.get("currentPrice") or info.get("regularMarketPrice", 0),
-                "avg_volume": info.get("averageDailyVolume10Day", 0),
-                "market_cap": info.get("marketCap", 0),
-                "exchange": info.get("exchange", ""),
-                "sector": info.get("sector", "Unknown"),
-                "industry": info.get("industry", "Unknown"),
-                "name": info.get("shortName", symbol),
+                "price": price,
+                "avg_volume": avg_vol,
+                "market_cap": mcap,
+                "exchange": getattr(fi, "exchange", ""),
+                "sector": "Trending Small-Cap",
+                "industry": "Momentum",
+                "name": symbol,
             }
+            self._info_cache[symbol] = info
+            return info
         except Exception as e:
-            logger.error(f"Failed to fetch info for {symbol}: {e}")
+            logger.debug(f"Failed to fetch fast_info for {symbol}: {e}")
             return {}
 
-    def get_penny_stock_universe(self) -> list[str]:
+    def get_penny_stock_universe(self, max_price: float = 10.0, min_price: float = 0.50, min_volume: int = 500_000) -> list[str]:
         """
-        Get a broad list of penny stock tickers to screen.
-        Uses yfinance screener for stocks under $5 with decent volume.
+        Get a broad list of penny stock tickers to screen, including live trending and active stocks.
+        Queries live Yahoo Finance screeners (day_gainers, most_actives) and merges with curated universe.
         """
-        logger.info("Building penny stock universe...")
-        # We'll use a curated approach: fetch from known small-cap lists
-        # and filter by price/volume criteria
+        logger.info("Discovering live trending and active penny stocks...")
+        screener_symbols = set()
+
+        # Method 1: Live Yahoo Finance Predefined Screeners (Day Gainers & Most Active)
         try:
-            # Fetch a broad set of small-cap tickers from known ETF holdings
-            # and popular penny stock lists
-            screener_symbols = set()
+            import requests
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            for scr_id in ["day_gainers", "most_actives"]:
+                url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&lang=en-US&region=US&scrIds={scr_id}&count=100"
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    quotes = resp.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+                    for q in quotes:
+                        sym = q.get("symbol", "")
+                        price = q.get("regularMarketPrice", 0) or 0
+                        vol = q.get("regularMarketVolume", 0) or q.get("averageDailyVolume3Month", 0) or 0
+                        # Filter for penny/small-cap range and liquid volume
+                        if sym and min_price <= price <= max_price and vol >= min_volume:
+                            screener_symbols.add(sym)
+                            # Cache basic info directly to save network calls later
+                            self._info_cache[sym] = {
+                                "symbol": sym,
+                                "name": q.get("shortName", sym),
+                                "price": price,
+                                "avg_volume": vol,
+                                "market_cap": q.get("marketCap", 0) or 0,
+                                "pe_ratio": q.get("trailingPE"),
+                                "beta": 1.5,
+                                "sector": "Trending Small-Cap",
+                                "industry": "Trending",
+                                "52w_high": q.get("fiftyTwoWeekHigh", price),
+                                "52w_low": q.get("fiftyTwoWeekLow", price),
+                                "change_pct": q.get("regularMarketChangePercent", 0),
+                            }
+            logger.info(f"Discovered {len(screener_symbols)} live trending/active penny stocks from Yahoo Finance")
+        except Exception as e:
+            logger.warning(f"Could not fetch live trending screeners: {e}")
 
-            # Method 1: Screen popular small-cap / micro-cap tickers
-            small_cap_etfs = ["IWC", "SCHA", "VB"]  # Micro/small cap ETFs
-            for etf_symbol in small_cap_etfs:
-                try:
-                    etf = yf.Ticker(etf_symbol)
-                    holdings = etf.info.get("holdings", [])
-                    if holdings:
-                        for h in holdings:
-                            if "symbol" in h:
-                                screener_symbols.add(h["symbol"])
-                except Exception:
-                    pass
-
-            # Method 2: Expand with comprehensive active sub-$10 / small-cap momentum universe
+        # If live screener returned few or no symbols, fallback to expanded list
+        if len(screener_symbols) < 10:
             expanded_pennies = [
-                # Top Volatile Penny Stocks ($0.50 - $5)
-                "SNDL", "CLNE", "GEVO", "MVIS", "BLNK", "DNA", "TELL", "GSAT",
+                "PDSB", "SNDL", "CLNE", "GEVO", "MVIS", "BLNK", "DNA", "TELL", "GSAT",
                 "BTBT", "BNGO", "WKHS", "BARK", "PSFE", "FCEL", "ZOM", "CTRM",
                 "SENS", "AEVA", "OUST", "CAN", "HUT", "BITF", "WULF",
-                # High-Volume Small-Cap / Growth ($2 - $10)
                 "PLUG", "SOFI", "NIO", "LCID", "MARA", "RIOT", "OPEN", "CLOV",
-                "BB", "NOK", "QS", "LAZR", "ACHR", "JOBY", "RIVN", "GRAB",
-                "PENN", "RUN", "CIFR", "IREN", "CLSK", "SOUN", "BBAI", "LUNR",
-                "ASTS", "RKLB"
+                "BB", "NOK", "QS", "LAZR", "ACHR", "JOBY", "RIVN", "GRAB"
             ]
             screener_symbols.update(expanded_pennies)
 
-            logger.info(f"Penny universe: {len(screener_symbols)} candidates")
-            return list(screener_symbols)
+        # Always include user's watchlist
+        watchlist = self.config.get("watchlist", {}).get("symbols", [])
+        screener_symbols.update([s.upper() for s in watchlist])
 
-        except Exception as e:
-            logger.error(f"Failed to build penny universe: {e}")
-            return []
+        # Also always include PDSB
+        screener_symbols.add("PDSB")
+
+        logger.info(f"Total penny universe for scanning: {len(screener_symbols)} symbols")
+        return sorted(list(screener_symbols))
 
     # ──────────────────────────────────────────────
     #  NEWS DATA

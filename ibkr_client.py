@@ -36,9 +36,11 @@ class IBKRClient:
         self.port = ibkr_cfg.get("port", 7497)  # 7497=TWS Paper
         self.client_id = ibkr_cfg.get("client_id", 1)
         self.account = ibkr_cfg.get("account", "")
+        self.account_type = ibkr_cfg.get("account_type", "cash")  # "cash" or "margin"
 
         self.ib = None
         self._connected = False
+        self._detected_account_type = None  # Auto-detected from IBKR
 
     # ──────────────────────────────────────────────
     #  CONNECTION
@@ -71,6 +73,9 @@ class IBKRClient:
             mode = "📝 PAPER" if is_paper else "💰 LIVE"
             logger.info(f"   Mode: {mode}")
 
+            # Auto-detect account type (Cash vs Margin)
+            self._detect_account_type()
+
             return True
 
         except Exception as e:
@@ -90,6 +95,44 @@ class IBKRClient:
         """Check if connected to IBKR."""
         return self._connected and self.ib is not None and self.ib.isConnected()
 
+    def _detect_account_type(self):
+        """
+        Auto-detect whether this is a Cash or Margin account from IBKR.
+        Updates self.account_type and self._detected_account_type.
+        """
+        try:
+            if not self.is_connected():
+                return
+
+            account_values = self.ib.accountSummary(self.account) if self.account else self.ib.accountSummary()
+            for av in account_values:
+                if av.tag == "AccountType":
+                    detected = av.value.strip().upper()
+                    self._detected_account_type = detected
+
+                    # Map IBKR types: "INDIVIDUAL" is usually margin-capable,
+                    # but we respect config override
+                    if self.account_type == "cash":
+                        logger.info(f"   Account type (config): CASH (IBKR reports: {detected})")
+                        if "MARGIN" in detected:
+                            logger.warning(
+                                "   ⚠️ IBKR reports a margin account but config is set to 'cash'. "
+                                "Cash account rules will be enforced."
+                            )
+                    else:
+                        self.account_type = "margin"
+                        logger.info(f"   Account type: MARGIN (IBKR: {detected})")
+                    break
+
+            logger.info(f"   🏦 Enforced mode: {self.account_type.upper()}")
+
+        except Exception as e:
+            logger.warning(f"   Could not detect account type: {e}. Using config: {self.account_type}")
+
+    def is_cash_account(self) -> bool:
+        """Check if running in cash account mode."""
+        return self.account_type == "cash"
+
     # ──────────────────────────────────────────────
     #  ACCOUNT INFO
     # ──────────────────────────────────────────────
@@ -108,9 +151,13 @@ class IBKRClient:
 
             for av in account_values:
                 if av.tag in ("NetLiquidation", "TotalCashValue", "BuyingPower",
-                              "GrossPositionValue", "MaintMarginReq"):
+                              "GrossPositionValue", "MaintMarginReq",
+                              "SettledCash", "AvailableFunds", "AccountType"):
                     try:
-                        summary[av.tag] = float(av.value)
+                        if av.tag == "AccountType":
+                            summary[av.tag] = av.value
+                        else:
+                            summary[av.tag] = float(av.value)
                     except (ValueError, TypeError):
                         pass
 
@@ -124,6 +171,44 @@ class IBKRClient:
         """Get current account net liquidation value."""
         summary = self.get_account_summary()
         return summary.get("NetLiquidation", 0.0)
+
+    def get_settled_cash(self) -> float:
+        """
+        Get settled cash available for trading.
+
+        On cash accounts, only settled funds can be used to buy.
+        Unsettled funds from recent sells (T+1) are excluded.
+
+        Returns:
+            Settled cash in USD. Falls back to TotalCashValue if
+            SettledCash is not available from IBKR.
+        """
+        summary = self.get_account_summary()
+        settled = summary.get("SettledCash", None)
+        if settled is not None:
+            return settled
+        # Fallback: AvailableFunds is usually settled on cash accounts
+        available = summary.get("AvailableFunds", None)
+        if available is not None:
+            return available
+        # Last resort: total cash (may include unsettled)
+        logger.warning("⚠️ SettledCash not available from IBKR — using TotalCashValue (may include unsettled funds)")
+        return summary.get("TotalCashValue", 0.0)
+
+    def get_buying_power(self) -> float:
+        """
+        Get available buying power.
+
+        On cash accounts, this equals settled cash.
+        On margin accounts, this includes leverage.
+
+        Returns:
+            Buying power in USD.
+        """
+        if self.is_cash_account():
+            return self.get_settled_cash()
+        summary = self.get_account_summary()
+        return summary.get("BuyingPower", 0.0)
 
     def get_positions(self) -> list[dict]:
         """Get current open positions."""

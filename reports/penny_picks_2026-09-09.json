@@ -1,0 +1,22 @@
+[
+  {
+    "symbol":"SNDL",
+    "name":"SNDL",
+    "price":1.4,
+    "sector":"Trending Small-Cap",
+    "volume_surge_score":42.4,
+    "momentum_score":46.6,
+    "technical_score":70.0,
+    "sentiment_score":50.0,
+    "relative_strength_score":44.8,
+    "total_score":50.6,
+    "ml_confidence":0.0,
+    "volume_ratio":1.27,
+    "return_5d_pct":-1.41,
+    "return_10d_pct":1.45,
+    "key_catalyst":"Technical breakout",
+    "suggested_stop_loss":1.29,
+    "suggested_target":1.61,
+    "rank":1
+  }
+]
