@@ -36,17 +36,28 @@ class FeatureEngine:
     def compute_features(
         self,
         df: pd.DataFrame,
-        sentiment_features: dict | None = None,
-        higher_tf_data: dict | None = None,
+        sentiment_features: Optional[dict] = None,
+        higher_tf_data: Optional[dict] = None,
+        macro_df: Optional[pd.DataFrame] = None,
+        fundamental_data: Optional[dict] = None,
+        quote_info: Optional[dict] = None,
+        news_articles: Optional[list[dict]] = None,
+        earnings_data: Optional[dict] = None,
+        as_of_time: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         """
-        Compute all features from OHLCV data.
+        Compute all features from OHLCV, macro, fundamental, and sentiment data.
 
         Args:
             df: DataFrame with columns Open, High, Low, Close, Volume
-            sentiment_features: Optional dict of sentiment scores to add
+            sentiment_features: Optional dict of pre-aggregated sentiment scores
             higher_tf_data: Optional dict with higher-timeframe context
-                            e.g. {"daily_ema_trend": 1, "daily_rsi": 55, "weekly_momentum": 0.02}
+            macro_df: Optional DataFrame with SPY/QQQ/IWM/VIX data
+            fundamental_data: Optional dict with float, short interest, ownership
+            quote_info: Optional dict with real-time quote metrics (spread, rel_volume)
+            news_articles: Optional list of raw news articles
+            earnings_data: Optional dict with days_until_earnings
+            as_of_time: Optional maximum cutoff timestamp to prevent lookahead leakage
 
         Returns:
             DataFrame with all engineered features (NaN rows from lookback dropped)
@@ -78,23 +89,29 @@ class FeatureEngine:
         self._add_returns(feat)
         self._add_price_features(feat)
 
-        # === CALENDAR FEATURES (cyclical encoding) ===
-        self._add_calendar_features(feat)
+        # === CALENDAR FEATURES (cyclical encoding + day-of-week + earnings) ===
+        self._add_calendar_features(feat, earnings_data=earnings_data)
 
-        # === NEW: MICROSTRUCTURE FEATURES ===
-        self._add_microstructure_features(feat)
+        # === MICROSTRUCTURE & LIQUIDITY FEATURES ===
+        self._add_microstructure_features(feat, quote_info=quote_info)
 
-        # === NEW: REGIME DETECTION FEATURES ===
+        # === MACRO REGIME & CONTEXT FEATURES ===
+        self._add_macro_features(feat, macro_df=macro_df)
+
+        # === FUNDAMENTAL & OWNERSHIP FEATURES ===
+        self._add_fundamental_features(feat, fundamental_data=fundamental_data)
+
+        # === REGIME DETECTION FEATURES ===
         self._add_regime_features(feat)
 
-        # === NEW: STATISTICAL FEATURES ===
+        # === STATISTICAL FEATURES ===
         self._add_statistical_features(feat)
         feat = feat.copy()
 
-        # === NEW: INTRADAY PATTERN FEATURES ===
+        # === INTRADAY PATTERN FEATURES ===
         self._add_intraday_features(feat)
 
-        # === NEW: MULTI-TIMEFRAME FEATURES ===
+        # === MULTI-TIMEFRAME FEATURES ===
         if higher_tf_data:
             htf_dict = {
                 k: 0.0 if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
@@ -103,14 +120,13 @@ class FeatureEngine:
             for k, val in htf_dict.items():
                 feat[k] = val
 
-        # === SENTIMENT FEATURES ===
-        if sentiment_features:
-            sent_dict = {
-                k: 0.0 if (v is None or pd.isna(v)) else float(v)
-                for k, v in sentiment_features.items()
-            }
-            for k, val in sent_dict.items():
-                feat[k] = val
+        # === NEWS SENTIMENT & CATALYST FEATURES (leakage-safe) ===
+        self._add_catalyst_and_news_features(
+            feat,
+            sentiment_features=sentiment_features,
+            news_articles=news_articles,
+            as_of_time=as_of_time,
+        )
 
         # Defragment DataFrame after all column additions
         feat = feat.copy()
@@ -259,11 +275,11 @@ class FeatureEngine:
     #  CALENDAR (cyclical encoding)
     # ──────────────────────────────────────────────
 
-    def _add_calendar_features(self, df: pd.DataFrame):
-        """Day-of-week and month seasonality with cyclical encoding."""
+    def _add_calendar_features(self, df: pd.DataFrame, earnings_data: Optional[dict] = None):
+        """Day-of-week, seasonality with cyclical encoding, and earnings proximity."""
         if isinstance(df.index, pd.DatetimeIndex):
-            # Cyclical encoding (better than raw integers for tree models)
             dow = df.index.dayofweek
+            df["day_of_week"] = dow.astype(float)
             df["sin_day_of_week"] = np.sin(2 * np.pi * dow / 5)
             df["cos_day_of_week"] = np.cos(2 * np.pi * dow / 5)
 
@@ -292,6 +308,21 @@ class FeatureEngine:
 
             # Days to monthly options expiration (3rd Friday)
             df["days_to_opex"] = df.index.to_series().apply(self._days_to_opex)
+        else:
+            df["day_of_week"] = 0.0
+            df["sin_day_of_week"] = 0.0
+            df["cos_day_of_week"] = 0.0
+            df["sin_month"] = 0.0
+            df["cos_month"] = 0.0
+            df["quarter"] = 1.0
+            df["is_month_start"] = 0
+            df["is_month_end"] = 0
+            df["days_to_opex"] = 15.0
+
+        days_earn = 999.0
+        if earnings_data and "days_until_earnings" in earnings_data:
+            days_earn = float(earnings_data.get("days_until_earnings", 999.0))
+        df["days_until_earnings"] = days_earn
 
     @staticmethod
     def _days_to_opex(dt) -> int:
@@ -324,22 +355,49 @@ class FeatureEngine:
         return max(0, min(delta, 30))  # Cap at 30
 
     # ──────────────────────────────────────────────
-    #  MICROSTRUCTURE (NEW)
+    #  MICROSTRUCTURE & LIQUIDITY
     # ──────────────────────────────────────────────
 
-    def _add_microstructure_features(self, df: pd.DataFrame):
+    def _add_microstructure_features(self, df: pd.DataFrame, quote_info: Optional[dict] = None):
         """
-        Microstructure proxies from OHLCV data.
-        These approximate order flow and market quality without L2 data.
+        Microstructure and liquidity proxies from OHLCV and real-time quote feeds.
+        Features: rel_volume, spread_pct, day_range_pos, year_range_pos,
+        tick intensity, price efficiency, cumulative delta, and Amihud illiquidity.
         """
         hl_range = df["High"] - df["Low"]
 
-        # Spread estimate: High-Low as proxy for bid-ask spread (normalized)
+        # Relative Volume (today's vol vs 20-period avg)
+        vol_sma_20 = df["Volume"].rolling(20, min_periods=1).mean()
+        df["rel_volume"] = (df["Volume"] / (vol_sma_20 + 1e-10)).round(2)
+
+        # Spread % estimate: (High - Low) / Close * 100
+        df["spread_pct"] = ((hl_range / (df["Close"] + 1e-10)) * 100.0).round(2)
+
+        # Day range position: 0 = at low, 1 = at high
+        df["day_range_pos"] = ((df["Close"] - df["Low"]) / (hl_range + 1e-10)).clip(0.0, 1.0).round(2)
+
+        # 52-week range position: 0 = at 52w low, 1 = at 52w high
+        high_252 = df.get("high_252d", df["High"].rolling(252, min_periods=20).max())
+        low_252 = df.get("low_252d", df["Low"].rolling(252, min_periods=20).min())
+        df["year_range_pos"] = ((df["Close"] - low_252) / (high_252 - low_252 + 1e-10)).clip(0.0, 1.0).round(2)
+
+        # Overwrite latest bar with real quote data if available from fetch_stock_info
+        if quote_info and not df.empty:
+            last_idx = df.index[-1]
+            if "rel_volume" in quote_info and quote_info["rel_volume"] is not None:
+                df.loc[last_idx, "rel_volume"] = float(quote_info["rel_volume"])
+            if "spread_pct" in quote_info and quote_info["spread_pct"] is not None:
+                df.loc[last_idx, "spread_pct"] = float(quote_info["spread_pct"])
+            if "day_range_pos" in quote_info and quote_info["day_range_pos"] is not None:
+                df.loc[last_idx, "day_range_pos"] = float(quote_info["day_range_pos"])
+            if "year_range_pos" in quote_info and quote_info["year_range_pos"] is not None:
+                df.loc[last_idx, "year_range_pos"] = float(quote_info["year_range_pos"])
+
+        # Spread estimate (normalized)
         df["spread_estimate"] = hl_range / df["Close"]
 
         # Tick intensity: Volume per unit of price range — measures aggression
         df["tick_intensity"] = df["Volume"] / (hl_range + 1e-10)
-        # Normalize to avoid scale issues
         df["tick_intensity_zscore"] = (
             (df["tick_intensity"] - df["tick_intensity"].rolling(20).mean())
             / (df["tick_intensity"].rolling(20).std() + 1e-10)
@@ -349,7 +407,6 @@ class FeatureEngine:
         df["price_efficiency"] = abs(df["Close"] - df["Open"]) / (hl_range + 1e-10)
 
         # Cumulative delta proxy: up-volume vs down-volume accumulation
-        # If close > open, volume is "up"; otherwise "down"
         up_vol = df["Volume"].where(df["Close"] >= df["Open"], 0)
         down_vol = df["Volume"].where(df["Close"] < df["Open"], 0)
         df["cum_delta_proxy"] = (up_vol - down_vol).rolling(10).sum()
@@ -359,6 +416,145 @@ class FeatureEngine:
         dollar_volume = df["Close"] * df["Volume"]
         df["amihud_illiquidity"] = abs(df["Close"].pct_change()) / (dollar_volume + 1e-10)
         df["amihud_illiquidity_20d"] = df["amihud_illiquidity"].rolling(20).mean()
+
+    # ──────────────────────────────────────────────
+    #  FUNDAMENTAL & OWNERSHIP FEATURES
+    # ──────────────────────────────────────────────
+
+    def _add_fundamental_features(self, df: pd.DataFrame, fundamental_data: Optional[dict] = None):
+        """
+        Add fundamental and ownership features (from fetch_full_info).
+        Features: float_shares, float_ratio, short_pct_float, short_ratio, insider_pct, institution_pct.
+        """
+        f = fundamental_data or {}
+        float_shares = float(f.get("float_shares") or 0.0)
+        shares_out = float(f.get("shares_outstanding") or 0.0)
+        float_ratio = float_shares / shares_out if (shares_out > 0 and float_shares > 0) else 0.8
+        short_pct_float = float(f.get("short_pct_float") or 0.0)
+        short_ratio = float(f.get("short_ratio") or 0.0)
+        insider_pct = float(f.get("insider_pct") or 0.0)
+        institution_pct = float(f.get("institution_pct") or 0.0)
+
+        df["float_shares"] = float_shares
+        df["float_ratio"] = float_ratio
+        df["short_pct_float"] = short_pct_float
+        df["short_ratio"] = short_ratio
+        df["insider_pct"] = insider_pct
+        df["institution_pct"] = institution_pct
+
+    # ──────────────────────────────────────────────
+    #  MACRO REGIME & CONTEXT FEATURES
+    # ──────────────────────────────────────────────
+
+    def _add_macro_features(self, df: pd.DataFrame, macro_df: Optional[pd.DataFrame] = None):
+        """
+        Add macro regime context features:
+        SPY, QQQ, IWM returns and relative strength + VIX level/change.
+        """
+        macro_cols = [
+            "spy_return_1d", "spy_return_5d",
+            "qqq_return_1d", "qqq_return_5d",
+            "iwm_return_1d", "iwm_return_5d",
+            "vix_level", "vix_change_5d",
+        ]
+        if macro_df is not None and not macro_df.empty:
+            try:
+                m = macro_df.copy()
+                if isinstance(m.index, pd.DatetimeIndex) and isinstance(df.index, pd.DatetimeIndex):
+                    # Convert both to tz-naive and harmonize datetime precision so timezone & dtype mismatches never crash
+                    df_idx = (df.index.tz_convert(None) if df.index.tz is not None else df.index).astype("datetime64[ns]")
+                    m_idx = (m.index.tz_convert(None) if m.index.tz is not None else m.index).astype("datetime64[ns]")
+
+                    m_clean = m.copy()
+                    m_clean["_macro_dt"] = m_idx
+                    m_clean = m_clean.sort_values("_macro_dt").drop_duplicates(subset=["_macro_dt"])
+
+                    target_df = pd.DataFrame({"_target_dt": df_idx}, index=df.index)
+                    # As-of backward merge: assigns each stock bar the latest available macro bar
+                    merged = pd.merge_asof(
+                        target_df.sort_values("_target_dt"),
+                        m_clean,
+                        left_on="_target_dt",
+                        right_on="_macro_dt",
+                        direction="backward",
+                    )
+                    merged.index = target_df.sort_values("_target_dt").index
+                    merged = merged.reindex(df.index)
+
+                    for col in macro_cols:
+                        default_val = 15.0 if "vix_level" in col else 0.0
+                        if col in merged.columns:
+                            s = merged[col].ffill().bfill().fillna(default_val)
+                            df[col] = s.values
+                        else:
+                            df[col] = default_val
+                else:
+                    for col in macro_cols:
+                        df[col] = 15.0 if "vix_level" in col else 0.0
+            except Exception as e:
+                logger.warning(f"Macro feature join failed, fallback to defaults: {e}")
+                for col in macro_cols:
+                    df[col] = 15.0 if "vix_level" in col else 0.0
+        else:
+            for col in macro_cols:
+                df[col] = 15.0 if "vix_level" in col else 0.0
+
+        # Relative strength vs SPY and Russell 2000 (IWM)
+        ret_1d = df["Close"].pct_change(1).fillna(0.0)
+        ret_5d = df["Close"].pct_change(5).fillna(0.0)
+        df["relative_strength_spy_1d"] = ret_1d - df["spy_return_1d"]
+        df["relative_strength_spy_5d"] = ret_5d - df["spy_return_5d"]
+        df["relative_strength_iwm_1d"] = ret_1d - df["iwm_return_1d"]
+
+    # ──────────────────────────────────────────────
+    #  NEWS SENTIMENT & CATALYST FEATURES
+    # ──────────────────────────────────────────────
+
+    def _add_catalyst_and_news_features(
+        self,
+        df: pd.DataFrame,
+        sentiment_features: Optional[dict] = None,
+        news_articles: Optional[list[dict]] = None,
+        as_of_time: Optional[pd.Timestamp] = None,
+    ):
+        """
+        Add news sentiment, volume, recency, and catalyst flags with zero lookahead leakage.
+        """
+        news_defaults = {
+            "sentiment_score": 0.0,
+            "news_count_1d": 0.0,
+            "news_count_3d": 0.0,
+            "news_count_7d": 0.0,
+            "days_since_last_news": 30.0,
+            "sentiment_momentum": 0.0,
+            "max_positive_score": 0.0,
+            "max_negative_score": 0.0,
+            "catalyst_earnings": 0.0,
+            "catalyst_fda": 0.0,
+            "catalyst_merger": 0.0,
+            "catalyst_offering": 0.0,
+            "catalyst_dilution": 0.0,
+        }
+
+        merged_news = dict(news_defaults)
+        if sentiment_features:
+            for k, v in sentiment_features.items():
+                if k in merged_news:
+                    merged_news[k] = 0.0 if (v is None or pd.isna(v)) else float(v)
+
+        if news_articles:
+            try:
+                from sentiment import SentimentAnalyzer
+                analyzer = SentimentAnalyzer()
+                computed = analyzer.compute_aggregate_sentiment(news_articles, as_of_time=as_of_time)
+                for k, v in computed.items():
+                    if k in merged_news:
+                        merged_news[k] = 0.0 if (v is None or pd.isna(v)) else float(v)
+            except Exception as e:
+                logger.debug(f"Could not compute news features from articles: {e}")
+
+        for col, val in merged_news.items():
+            df[col] = val
 
     # ──────────────────────────────────────────────
     #  REGIME DETECTION (NEW)

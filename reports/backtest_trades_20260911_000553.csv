@@ -1,0 +1,2 @@
+entry_date,exit_date,type,entry_price,exit_price,shares,stop_loss,take_profit,pnl,pnl_pct,exit_reason,commission
+2026-09-09 15:45:00-04:00,2026-09-10 09:30:00-04:00,long,0.2961,0.2964,91,0.29654414999999995,0.3102,0.03,0.1,Stop-loss (Breakeven/Trailing),0.91

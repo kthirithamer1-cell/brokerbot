@@ -1,0 +1,11 @@
+symbol,name,price,sector,volume_surge_score,momentum_score,technical_score,sentiment_score,relative_strength_score,total_score,ml_confidence,volume_ratio,return_5d_pct,return_10d_pct,key_catalyst,suggested_stop_loss,suggested_target,rank
+DBI,Designer Brands Inc.,5.99,Trending Small-Cap,93.0,100.0,70.0,80.0,100.0,88.2,0.0,2.79,16.31,9.51,High volume + Strong momentum,5.51,6.89,1
+VIOT,"Viomi Technology Co., Ltd",1.36,Trending Small-Cap,53.9,100.0,70.0,100.0,59.9,76.5,0.0,1.62,0.0,65.85,Technical breakout + Positive news,1.25,1.56,2
+GPRO,"GoPro, Inc.",1.4,Trending Small-Cap,33.1,100.0,70.0,76.9,63.5,67.2,0.0,1.0,0.72,131.4,Technical breakout + Positive news,1.29,1.61,3
+MYGN,"Myriad Genetics, Inc.",3.36,Trending Small-Cap,79.7,84.3,55.0,0.0,80.0,59.8,0.0,2.39,4.02,5.66,High volume + Contrarian (neg. sentiment),3.09,3.86,4
+TLYS,"Tilly's, Inc.",4.29,Trending Small-Cap,19.5,66.8,70.0,69.2,47.4,53.2,0.0,0.59,-2.5,11.72,Technical breakout,3.95,4.93,5
+AMPY,Amplify Energy Corp.,4.96,Trending Small-Cap,20.7,69.4,65.0,50.0,66.0,52.0,0.0,0.62,1.22,5.31,Technical breakout,4.56,5.7,6
+LDI,"loanDepot, Inc.",0.83,Trending Small-Cap,100.0,0.0,68.0,50.0,2.4,49.0,0.0,3.18,-11.51,-14.51,Volume surge + Technical breakout,0.77,0.96,7
+OXSQ,Oxford Square Capital Corp.,1.34,Trending Small-Cap,20.6,42.6,58.0,50.0,56.2,43.7,0.0,0.62,-0.74,-1.47,Multi-factor,1.23,1.54,8
+CRMT,"America's Car-Mart, Inc.",1.59,Trending Small-Cap,100.0,0.0,68.0,12.5,0.0,41.1,0.0,3.46,-28.05,-31.17,Volume surge + Technical breakout,1.46,1.83,9
+FIP,FTAI Infrastructure Inc.,3.3,Trending Small-Cap,31.3,15.6,58.0,50.0,49.5,40.0,0.0,0.94,-2.08,-9.59,Multi-factor,3.04,3.79,10

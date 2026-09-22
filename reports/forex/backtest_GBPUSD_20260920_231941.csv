@@ -1,0 +1,3 @@
+pair,direction,entry_price,exit_price,units,pnl_pips,pnl_usd,spread_cost,swap_cost,bars_held,reason,entry_date,exit_date
+GBPUSD,SHORT,1.3492773258209227,1.34678,3000,25.0,7.05,0.45,0.0,23,TP,2026-09-14 08:15:00+01:00,2026-09-14 14:00:00+01:00
+GBPUSD,SHORT,1.3500059329986571,1.34751,3000,25.0,6.9,0.45,0.15,42,TP,2026-09-14 20:45:00+01:00,2026-09-15 07:15:00+01:00

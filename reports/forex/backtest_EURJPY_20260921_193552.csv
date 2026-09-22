@@ -1,0 +1,2 @@
+pair,direction,entry_price,exit_price,units,pnl_pips,pnl_usd,spread_cost,swap_cost,bars_held,reason,entry_date,exit_date
+EURJPY,SHORT,178.22899353027344,178.70528,1000,-47.6,-4.91,0.15,0.0,11,SL,2026-09-14 20:00:00+01:00,2026-09-15 07:00:00+01:00

@@ -12,7 +12,7 @@ Upgraded with:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -27,12 +27,12 @@ class Backtester:
     Walk-forward backtest engine with realistic execution simulation.
 
     Features:
-        - Realistic commissions (IBKR tiered rate)
+        - Realistic commissions (IBKR tiered rate with real $1.00 minimum)
         - Slippage estimation
-        - Long AND short trade simulation
+        - Cash account execution (shorts disabled, T+1 settlement, GFV tracking)
         - Full performance metrics (win rate, profit factor, Sharpe, max drawdown)
-        - Monte Carlo analysis with confidence intervals
-        - Weekly P&L breakdown for target tracking
+        - Monte Carlo bootstrap analysis with confidence intervals
+        - Weekly P&L breakdown for target tracking (ISO calendar)
         - Trade-by-trade log
         - Equity curve
     """
@@ -45,17 +45,37 @@ class Backtester:
         self.initial_capital = bt_cfg.get("initial_capital", 100_000)
         self.commission_per_share = bt_cfg.get("commission_per_share", 0.005)
         self.slippage_pct = bt_cfg.get("slippage_pct", 0.05) / 100
-        self.enable_shorts = bt_cfg.get("enable_shorts", False)
+
+        # Cash account: shorting is not executable, force it off regardless of config
+        if bt_cfg.get("enable_shorts", False):
+            logger.warning(
+                "enable_shorts=True in config, but IBKR CASH accounts cannot short sell. "
+                "Forcing enable_shorts=False for this backtest."
+            )
+        self.enable_shorts = False  # was: bt_cfg.get("enable_shorts", False)
+
+        # T+1 settlement tracking (cash accounts only)
+        self.settlement_days = bt_cfg.get("settlement_days", 1)  # T+1 as of 2024
+        self.gfv_limit_per_rolling_year = bt_cfg.get("gfv_limit", 3)
+
+        # Real IBKR minimum commission per order
+        self.min_commission_per_order = bt_cfg.get("min_commission_per_order", 1.00)
+
+        # Entry filter thresholds for confirmation features
+        self.rsi_overbought = bt_cfg.get("rsi_overbought", 75)
+        self.min_volume_ratio = bt_cfg.get("min_volume_ratio", 1.0)
+        self.confidence_size_scaling = bt_cfg.get("confidence_size_scaling", True)
+
         self.monte_carlo_iterations = bt_cfg.get("monte_carlo_iterations", 1000)
         self.monte_carlo_confidence = bt_cfg.get("monte_carlo_confidence", 0.95)
 
         risk_cfg = self.config.get("risk", {})
         self.max_risk_per_trade = risk_cfg.get("max_risk_per_trade_pct", 1.5) / 100
         self.max_position_pct = risk_cfg.get("max_position_pct", 5.0) / 100
-        self.stop_loss_atr_mult = risk_cfg.get("stop_loss_atr_mult", 2.0)
-        self.take_profit_atr_mult = risk_cfg.get("take_profit_atr_mult", 3.0)
-        self.enable_breakeven_stop = risk_cfg.get("enable_breakeven_stop", True)
-        self.breakeven_atr_mult = risk_cfg.get("breakeven_atr_mult", 1.0)
+        self.stop_loss_atr_mult = risk_cfg.get("stop_loss_atr_mult", 3.0)
+        self.take_profit_atr_mult = risk_cfg.get("take_profit_atr_mult", 4.5)
+        self.enable_breakeven_stop = risk_cfg.get("enable_breakeven_stop", False)
+        self.breakeven_atr_mult = risk_cfg.get("breakeven_atr_mult", 1.5)
         self.trailing_stop = risk_cfg.get("trailing_stop", True)
 
         self.report_dir = Path("reports")
@@ -125,17 +145,122 @@ class Backtester:
             "equity_curve": equity_curve,
         }
 
+    def _commission(self, shares: int) -> float:
+        """IBKR tiered commission with the real $1.00/order minimum (not $0.01)."""
+        return max(shares * self.commission_per_share, self.min_commission_per_order)
+
+    def _init_settlement_state(self):
+        """Call once at the start of _simulate()."""
+        self.settled_cash = float(self.initial_capital)
+        self.unsettled_cash = 0.0
+        # queue of (settle_date, amount) for proceeds still settling
+        self._pending_settlements: list[tuple] = []
+        # track which settled-cash "batches" were used for buys, to detect GFVs
+        self._gfv_log: list[dict] = []
+        self._buys_funded_by_unsettled_today: list = []
+
+    def _process_settlements(self, current_date):
+        """Move any proceeds that have finished settling into settled_cash."""
+        still_pending = []
+        for settle_date, amount in self._pending_settlements:
+            if current_date >= settle_date:
+                self.settled_cash += amount
+                self.unsettled_cash = max(0.0, self.unsettled_cash - amount)
+            else:
+                still_pending.append((settle_date, amount))
+        self._pending_settlements = still_pending
+
+    def _add_unsettled_proceeds(self, amount: float, trade_date):
+        """Sale proceeds go here, become settled after `settlement_days` business days."""
+        settle_date = trade_date + pd.tseries.offsets.BDay(self.settlement_days)
+        self._pending_settlements.append((settle_date, amount))
+        self.unsettled_cash += amount
+
+    def _record_potential_gfv(self, buy_date, used_unsettled: bool):
+        """
+        A Good Faith Violation occurs when a security bought with unsettled funds
+        is sold before those funds settle. We approximate: flag any buy funded by
+        unsettled cash, then check on exit whether the funding trade had settled yet.
+        """
+        if used_unsettled:
+            self._gfv_log.append({"buy_date": buy_date, "flagged": True})
+
+    def _count_recent_gfvs(self, as_of_date) -> int:
+        """GFVs count on a rolling 12-month basis per FINRA/IBKR rules."""
+        if not isinstance(as_of_date, (datetime, pd.Timestamp)):
+            try:
+                as_of_date = pd.to_datetime(as_of_date)
+            except Exception:
+                as_of_date = datetime.now()
+        cutoff = as_of_date - timedelta(days=365)
+        count = 0
+        for g in self._gfv_log:
+            b_date = g["buy_date"]
+            if not isinstance(b_date, (datetime, pd.Timestamp)):
+                try:
+                    b_date = pd.to_datetime(b_date)
+                except Exception:
+                    continue
+            if hasattr(cutoff, "tzinfo") and cutoff.tzinfo and hasattr(b_date, "tzinfo") and not b_date.tzinfo:
+                b_date = b_date.tz_localize(cutoff.tzinfo)
+            elif hasattr(b_date, "tzinfo") and b_date.tzinfo and hasattr(cutoff, "tzinfo") and not cutoff.tzinfo:
+                cutoff = cutoff.tz_localize(b_date.tzinfo)
+            if b_date >= cutoff:
+                count += 1
+        return count
+
+    def _safe_atr(self, row, price: float) -> float:
+        """row.get('atr', default) does NOT catch NaN — only a missing key.
+        During the rolling-window warm-up, atr is present but NaN, so the old
+        code silently used NaN in comparisons (always False) instead of falling
+        back. This fixes that."""
+        atr = row.get("atr", np.nan)
+        if pd.isna(atr) or atr <= 0:
+            return price * 0.02
+        return float(atr)
+
+    def _confirms_entry(self, row) -> bool:
+        """
+        Wires in confidence/RSI/volume features that were being merged into df
+        but never actually used in the entry decision.
+        """
+        # VWAP filter (already existed)
+        if "close_vs_vwap" in row and pd.notna(row["close_vs_vwap"]) and row["close_vs_vwap"] < -0.03:
+            return False
+
+        # Don't buy into an already-overbought move
+        if "rsi_14" in row and pd.notna(row["rsi_14"]) and row["rsi_14"] >= self.rsi_overbought:
+            return False
+
+        # Require the move to actually have volume behind it
+        if "volume_ratio_sma20" in row and pd.notna(row["volume_ratio_sma20"]):
+            if row["volume_ratio_sma20"] < self.min_volume_ratio:
+                return False
+
+        return True
+
+    def _size_multiplier_from_confidence(self, row) -> float:
+        """Scale position size by model confidence when available, instead of
+        treating every signal at max size regardless of conviction."""
+        if not self.confidence_size_scaling:
+            return 1.0
+        conf = row.get("confidence", None)
+        if conf is None or pd.isna(conf):
+            return 1.0
+        return float(np.clip(conf, 0.3, 1.0))
+
     def _simulate(self, df: pd.DataFrame) -> tuple[list[dict], pd.Series]:
-        """Core simulation loop with long and short support."""
-        cash = self.initial_capital
-        position = None  # {type, shares, entry_price, stop_loss, take_profit, entry_date}
+        """Core simulation loop with cash account settlement, gaps, and GFV tracking."""
+        self._init_settlement_state()
+        position = None  # {type, shares, entry_price, stop_loss, take_profit, entry_date, funded_by_unsettled}
         trades = []
         equity = []
 
         for i, (dt, row) in enumerate(df.iterrows()):
+            self._process_settlements(dt)
             price = row["Close"]
             signal = row["signal"]
-            atr = row.get("atr", price * 0.02)
+            atr = self._safe_atr(row, price)
 
             # ── Check exit conditions for open position ──
             if position is not None:
@@ -152,68 +277,45 @@ class Backtester:
                         trail_price = row["High"] - (atr * self.stop_loss_atr_mult)
                         if trail_price > position["stop_loss"]:
                             position["stop_loss"] = trail_price
-                elif position["type"] == "short":
-                    if self.enable_breakeven_stop and row["Low"] <= position["entry_price"] - atr * self.breakeven_atr_mult:
-                        be_price = position["entry_price"] * (1 - self.slippage_pct - 0.001)
-                        if be_price < position["stop_loss"]:
-                            position["stop_loss"] = be_price
-
-                    if self.trailing_stop:
-                        trail_price = row["Low"] + (atr * self.stop_loss_atr_mult)
-                        if trail_price < position["stop_loss"]:
-                            position["stop_loss"] = trail_price
 
                 exit_price = None
                 exit_reason = None
 
                 if position["type"] == "long":
-                    # Stop-loss hit (intrabar check using Low)
-                    if row["Low"] <= position["stop_loss"]:
+                    open_price = row["Open"]
+
+                    # If price GAPPED past the stop at the open, you fill at the open,
+                    # not at the theoretical stop price — this matters a lot for penny
+                    # stocks which gap violently on dilution/news.
+                    if open_price <= position["stop_loss"]:
+                        exit_price = open_price
+                        exit_reason = "Stop-loss (gap)"
+                    elif row["Low"] <= position["stop_loss"]:
                         exit_price = position["stop_loss"]
                         exit_reason = "Stop-loss (Breakeven/Trailing)" if position["stop_loss"] >= position["entry_price"] else "Stop-loss"
-                    # Take-profit hit (intrabar check using High)
+                    elif open_price >= position["take_profit"]:
+                        exit_price = open_price
+                        exit_reason = "Take-profit (gap)"
                     elif row["High"] >= position["take_profit"]:
                         exit_price = position["take_profit"]
                         exit_reason = "Take-profit"
-                    # Sell signal from model
                     elif signal == -1:
                         exit_price = price
                         exit_reason = "Sell signal"
 
-                elif position["type"] == "short":
-                    # Stop-loss hit for short (using High)
-                    if row["High"] >= position["stop_loss"]:
-                        exit_price = position["stop_loss"]
-                        exit_reason = "Stop-loss"
-                    # Take-profit hit for short (using Low)
-                    elif row["Low"] <= position["take_profit"]:
-                        exit_price = position["take_profit"]
-                        exit_reason = "Take-profit"
-                    # Buy signal from model (close short)
-                    elif signal == 1:
-                        exit_price = price
-                        exit_reason = "Buy signal (close short)"
-
-                if exit_price:
+                if exit_price is not None:
                     # Apply slippage
-                    if position["type"] == "long":
-                        exit_price *= (1 - self.slippage_pct)
-                    else:  # short — slippage works against us when buying to cover
-                        exit_price *= (1 + self.slippage_pct)
+                    exit_price *= (1 - self.slippage_pct)
 
-                    # Commission
-                    commission = position["shares"] * self.commission_per_share
+                    entry_comm = self._commission(position["shares"])
+                    exit_comm = self._commission(position["shares"])
+                    round_trip_comm = entry_comm + exit_comm
 
-                    # PnL
-                    if position["type"] == "long":
-                        pnl = (exit_price - position["entry_price"]) * position["shares"]
-                        pnl_pct = (exit_price / position["entry_price"] - 1) * 100
-                        cash += exit_price * position["shares"] - commission
-                    else:  # short
-                        pnl = (position["entry_price"] - exit_price) * position["shares"]
-                        pnl_pct = (1 - exit_price / position["entry_price"]) * 100
-                        # Return collateral + profit (or minus loss)
-                        cash += position["collateral"] + pnl - commission
+                    pnl = (exit_price - position["entry_price"]) * position["shares"] - round_trip_comm
+                    pnl_pct = ((exit_price - position["entry_price"]) / position["entry_price"]) * 100
+
+                    net_proceeds = exit_price * position["shares"] - exit_comm
+                    self._add_unsettled_proceeds(net_proceeds, dt)
 
                     trades.append({
                         "entry_date": position["entry_date"],
@@ -227,63 +329,41 @@ class Backtester:
                         "pnl": round(pnl, 2),
                         "pnl_pct": round(pnl_pct, 2),
                         "exit_reason": exit_reason,
-                        "commission": round(commission * 2, 2),  # round-trip
+                        "commission": round(round_trip_comm, 2),
+                        "funded_by_unsettled": position.get("funded_by_unsettled", False),
                     })
 
                     position = None
 
             # ── Check entry conditions ──
             if position is None:
-                # Filter: reject long if price is severely lagging session VWAP (deep selloff)
-                allow_buy = True
-                if "close_vs_vwap" in row and pd.notna(row["close_vs_vwap"]):
-                    if row["close_vs_vwap"] < -0.03:
-                        allow_buy = False
-
-                # LONG entry
-                if signal == 1 and allow_buy:
+                if signal == 1 and self._confirms_entry(row):
+                    size_mult = self._size_multiplier_from_confidence(row)
                     position = self._open_position(
-                        "long", price, atr, cash, dt
+                        "long", price, atr, dt, size_mult
                     )
-                    if position:
-                        cash -= position["shares"] * position["entry_price"] + \
-                               max(position["shares"] * self.commission_per_share, 0.01)
-
-                # SHORT entry
-                elif signal == -1 and self.enable_shorts:
-                    position = self._open_position(
-                        "short", price, atr, cash, dt
-                    )
-                    if position:
-                        # For shorts, we need collateral
-                        cash -= position["collateral"] + \
-                               max(position["shares"] * self.commission_per_share, 0.01)
 
             # Track equity
-            portfolio_value = cash
+            portfolio_value = self.settled_cash + self.unsettled_cash
             if position is not None:
-                if position["type"] == "long":
-                    portfolio_value += position["shares"] * price
-                else:  # short
-                    # Collateral + unrealized PnL
-                    unrealized_pnl = (position["entry_price"] - price) * position["shares"]
-                    portfolio_value += position["collateral"] + unrealized_pnl
+                portfolio_value += position["shares"] * price
 
             equity.append(portfolio_value)
 
         # Close any remaining position at last price
         if position is not None:
             last_price = df["Close"].iloc[-1]
-            if position["type"] == "long":
-                last_price *= (1 - self.slippage_pct)
-                pnl = (last_price - position["entry_price"]) * position["shares"]
-                pnl_pct = (last_price / position["entry_price"] - 1) * 100
-            else:
-                last_price *= (1 + self.slippage_pct)
-                pnl = (position["entry_price"] - last_price) * position["shares"]
-                pnl_pct = (1 - last_price / position["entry_price"]) * 100
+            last_price *= (1 - self.slippage_pct)
 
-            commission = position["shares"] * self.commission_per_share
+            entry_comm = self._commission(position["shares"])
+            exit_comm = self._commission(position["shares"])
+            round_trip_comm = entry_comm + exit_comm
+
+            pnl = (last_price - position["entry_price"]) * position["shares"] - round_trip_comm
+            pnl_pct = ((last_price - position["entry_price"]) / position["entry_price"]) * 100
+
+            net_proceeds = last_price * position["shares"] - exit_comm
+            self._add_unsettled_proceeds(net_proceeds, df.index[-1])
 
             trades.append({
                 "entry_date": position["entry_date"],
@@ -294,82 +374,88 @@ class Backtester:
                 "shares": position["shares"],
                 "stop_loss": position["stop_loss"],
                 "take_profit": position["take_profit"],
-                "pnl": round(pnl - commission, 2),
+                "pnl": round(pnl, 2),
                 "pnl_pct": round(pnl_pct, 2),
                 "exit_reason": "End of backtest",
-                "commission": round(commission * 2, 2),
+                "commission": round(round_trip_comm, 2),
+                "funded_by_unsettled": position.get("funded_by_unsettled", False),
             })
+            position = None
 
         equity_series = pd.Series(equity, index=df.index, name="equity")
         return trades, equity_series
 
     def _open_position(
-        self, pos_type: str, price: float, atr: float, cash: float, dt
+        self, pos_type: str, price: float, atr: float, dt, size_multiplier: float = 1.0
     ) -> dict | None:
-        """Create a position dict with proper stops and sizing."""
-        # Entry with slippage
-        if pos_type == "long":
-            entry_price = price * (1 + self.slippage_pct)
-        else:
-            entry_price = price * (1 - self.slippage_pct)
+        """
+        Create a long position with cash account rules, real commissions, and GFV tracking.
+        """
+        if pos_type == "short":
+            logger.warning("Short entry requested but shorts are disabled for cash accounts — skipping")
+            return None
 
-        # ATR-based stops
+        entry_price = price * (1 + self.slippage_pct)
+
         if atr > 0 and not np.isnan(atr):
-            if pos_type == "long":
-                stop_loss = entry_price - atr * self.stop_loss_atr_mult
-                take_profit = entry_price + atr * self.take_profit_atr_mult
-            else:  # short
-                stop_loss = entry_price + atr * self.stop_loss_atr_mult
-                take_profit = entry_price - atr * self.take_profit_atr_mult
+            stop_loss = entry_price - atr * self.stop_loss_atr_mult
+            take_profit = entry_price + atr * self.take_profit_atr_mult
         else:
-            if pos_type == "long":
-                stop_loss = entry_price * 0.98
-                take_profit = entry_price * 1.04
-            else:
-                stop_loss = entry_price * 1.02
-                take_profit = entry_price * 0.96
+            stop_loss = entry_price * 0.98
+            take_profit = entry_price * 1.04
 
-        # Ensure minimum stop distance
-        if pos_type == "long":
-            stop_loss = min(stop_loss, entry_price * 0.995)
-        else:
-            stop_loss = max(stop_loss, entry_price * 1.005)
-
+        stop_loss = min(stop_loss, entry_price * 0.995)
         risk_per_share = abs(entry_price - stop_loss)
-
         if risk_per_share <= 0:
             return None
 
-        # Position sizing
-        if cash < 500:
-            # Micro account: use up to 90% of available cash
-            shares = int((cash * 0.90) / entry_price)
-            shares = max(shares, 1)
+        available_cash = self.settled_cash + self.unsettled_cash  # total buying power view
+        if available_cash < 500:
+            shares = max(int((available_cash * 0.90 * size_multiplier) / entry_price), 1)
         else:
-            risk_amount = cash * self.max_risk_per_trade
+            risk_amount = available_cash * self.max_risk_per_trade * size_multiplier
             max_shares_risk = int(risk_amount / risk_per_share)
-            max_shares_pos = int(cash * self.max_position_pct / entry_price)
-            shares = min(max_shares_risk, max_shares_pos)
-            shares = max(shares, 1)
+            max_shares_pos = int(available_cash * self.max_position_pct * size_multiplier / entry_price)
+            shares = max(min(max_shares_risk, max_shares_pos), 1)
 
-        # Check we can afford it
-        required_capital = shares * entry_price
-        if required_capital > cash:
+        required_capital = shares * entry_price + self._commission(shares)
+        if required_capital > available_cash:
             return None
 
-        position = {
-            "type": pos_type,
+        # Determine whether this buy dips into still-unsettled funds (GFV risk)
+        used_unsettled = required_capital > self.settled_cash
+        if used_unsettled:
+            # Spend settled first, then unsettled
+            from_unsettled = required_capital - self.settled_cash
+            self.settled_cash = 0.0
+            self.unsettled_cash = max(0.0, self.unsettled_cash - from_unsettled)
+
+            # Deduct the spent funds from the pending settlements queue (oldest first)
+            rem = from_unsettled
+            new_pending = []
+            for s_date, amt in self._pending_settlements:
+                if rem <= 0:
+                    new_pending.append((s_date, amt))
+                elif amt <= rem:
+                    rem -= amt
+                else:
+                    new_pending.append((s_date, amt - rem))
+                    rem = 0.0
+            self._pending_settlements = new_pending
+        else:
+            self.settled_cash -= required_capital
+
+        self._record_potential_gfv(dt, used_unsettled)
+
+        return {
+            "type": "long",
             "entry_date": dt,
             "entry_price": round(entry_price, 4),
             "shares": shares,
             "stop_loss": round(stop_loss, 4),
             "take_profit": round(take_profit, 4),
+            "funded_by_unsettled": used_unsettled,
         }
-
-        if pos_type == "short":
-            position["collateral"] = round(required_capital, 2)
-
-        return position
 
     def _compute_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """Compute Average True Range."""
@@ -386,6 +472,10 @@ class Backtester:
 
     def _compute_metrics(self, trades: list[dict], equity: pd.Series) -> dict:
         """Compute comprehensive performance metrics."""
+        last_dt = equity.index[-1] if len(equity) > 0 else datetime.now()
+        gfv_count = self._count_recent_gfvs(last_dt)
+        unsettled_funded_count = sum(1 for t in trades if t.get("funded_by_unsettled"))
+
         if not trades:
             final_equity = equity.iloc[-1] if len(equity) > 0 else self.initial_capital
             return {
@@ -409,6 +499,9 @@ class Backtester:
                 "long_trades": 0,
                 "short_trades": 0,
                 "exit_reasons": {},
+                "gfv_count_last_12mo": gfv_count,
+                "gfv_limit": self.gfv_limit_per_rolling_year,
+                "trades_funded_by_unsettled_cash": unsettled_funded_count,
                 "note": "No trades executed with current confidence threshold",
             }
 
@@ -487,21 +580,25 @@ class Backtester:
             "long_trades": long_trades,
             "short_trades": short_trades,
             "exit_reasons": exit_reasons,
+            "gfv_count_last_12mo": gfv_count,
+            "gfv_limit": self.gfv_limit_per_rolling_year,
+            "trades_funded_by_unsettled_cash": unsettled_funded_count,
         }
 
         return metrics
 
     def _compute_weekly_pnl(self, trades: list[dict], equity: pd.Series) -> dict:
-        """Compute weekly P&L breakdown for $5/week target tracking."""
+        """Fixed: use ISO year instead of dt.year, which mis-buckets trades at
+        year boundaries (e.g. Dec 30 can be ISO week 1 of the *next* ISO year)."""
         if not trades:
             return {"weeks": [], "target_hit_rate": 0}
 
         trade_df = pd.DataFrame(trades)
         trade_df["exit_date"] = pd.to_datetime(trade_df["exit_date"])
 
-        # Group by week
-        trade_df["week"] = trade_df["exit_date"].dt.isocalendar().week.astype(int)
-        trade_df["year"] = trade_df["exit_date"].dt.year
+        iso = trade_df["exit_date"].dt.isocalendar()
+        trade_df["week"] = iso["week"].astype(int)
+        trade_df["year"] = iso["year"].astype(int)  # FIX: ISO year, not .dt.year
 
         weekly_groups = trade_df.groupby(["year", "week"]).agg(
             pnl=("pnl", "sum"),
@@ -509,7 +606,7 @@ class Backtester:
             wins=("pnl", lambda x: (x > 0).sum()),
         ).reset_index()
 
-        target = self.config.get("targets", {}).get("daily_profit_target", 5.0) * 5  # Weekly target
+        target = self.config.get("targets", {}).get("daily_profit_target", 5.0) * 5
 
         weeks = []
         for _, row in weekly_groups.iterrows():
@@ -519,7 +616,7 @@ class Backtester:
                 "pnl": round(row["pnl"], 2),
                 "trades": int(row["trades"]),
                 "wins": int(row["wins"]),
-                "hit_target": row["pnl"] >= target,
+                "hit_target": bool(row["pnl"] >= target),
             })
 
         target_hit_count = sum(1 for w in weeks if w["hit_target"])
@@ -531,44 +628,45 @@ class Backtester:
             "target_hit_count": target_hit_count,
             "target_hit_rate": round(target_hit_rate, 1),
             "weekly_target": target,
-            "avg_weekly_pnl": round(np.mean([w["pnl"] for w in weeks]), 2) if weeks else 0,
-            "best_week": round(max(w["pnl"] for w in weeks), 2) if weeks else 0,
-            "worst_week": round(min(w["pnl"] for w in weeks), 2) if weeks else 0,
+            "avg_weekly_pnl": round(float(np.mean([w["pnl"] for w in weeks])), 2) if weeks else 0,
+            "best_week": round(float(max(w["pnl"] for w in weeks)), 2) if weeks else 0,
+            "worst_week": round(float(min(w["pnl"] for w in weeks)), 2) if weeks else 0,
         }
 
     def _monte_carlo_analysis(self, trades: list[dict]) -> dict:
         """
-        Monte Carlo simulation: shuffle trade order to compute confidence intervals.
+        FIXED: the old version shuffled trade order and took cumsum()[-1] as
+        "final equity" — but sum() is order-invariant, so every iteration
+        produced the same number. The percentiles reported a fake confidence
+        interval around a single value.
 
-        Answers: "With 95% confidence, what is my expected weekly PnL range?"
+        Fix: bootstrap resample WITH replacement (not just permute) to generate
+        genuinely different possible equity paths, which is what a real
+        Monte Carlo confidence interval requires.
         """
         if len(trades) < 10:
             return {"error": "Too few trades for Monte Carlo"}
 
-        logger.info(f"Running Monte Carlo: {self.monte_carlo_iterations} iterations...")
+        logger.info(f"Running Monte Carlo (bootstrap): {self.monte_carlo_iterations} iterations...")
 
-        pnls = [t["pnl"] for t in trades]
+        pnls = np.array([t["pnl"] for t in trades])
         n_trades = len(pnls)
-
-        # Simulate many possible orderings
-        final_equities = []
-        weekly_pnls = []
-
         rng = np.random.default_rng(42)
 
-        for _ in range(self.monte_carlo_iterations):
-            shuffled = rng.permutation(pnls)
-            cumulative = np.cumsum(shuffled) + self.initial_capital
-            final_equities.append(cumulative[-1])
+        final_equities = []
+        weekly_pnls = []
+        trades_per_week_estimate = max(1, round(n_trades / max(1, self._estimate_weeks_spanned(trades))))
 
-            # Approximate weekly PnL (assume ~5 trades per week for active scalping)
-            trades_per_week = max(1, n_trades // max(1, n_trades // 5))
-            week_pnls = []
-            for i in range(0, len(shuffled), trades_per_week):
-                week_pnl = sum(shuffled[i:i + trades_per_week])
-                week_pnls.append(week_pnl)
-            if week_pnls:
-                weekly_pnls.extend(week_pnls)
+        for _ in range(self.monte_carlo_iterations):
+            # Bootstrap: sample n_trades pnls WITH REPLACEMENT — this is what
+            # actually creates variance across iterations, unlike a permutation.
+            resampled = rng.choice(pnls, size=n_trades, replace=True)
+            final_equity = self.initial_capital + resampled.sum()
+            final_equities.append(final_equity)
+
+            for i in range(0, n_trades, trades_per_week_estimate):
+                week_pnl = resampled[i:i + trades_per_week_estimate].sum()
+                weekly_pnls.append(week_pnl)
 
         final_equities = np.array(final_equities)
         weekly_pnls = np.array(weekly_pnls)
@@ -577,9 +675,12 @@ class Backtester:
         lower_pct = (1 - confidence) / 2 * 100
         upper_pct = (1 - (1 - confidence) / 2) * 100
 
+        target = self.config.get("targets", {}).get("daily_profit_target", 5.0) * 5
+
         return {
             "iterations": self.monte_carlo_iterations,
             "confidence_level": confidence,
+            "method": "bootstrap_with_replacement",
             "final_equity": {
                 "mean": round(float(np.mean(final_equities)), 2),
                 "median": round(float(np.median(final_equities)), 2),
@@ -592,11 +693,16 @@ class Backtester:
                 f"p{lower_pct:.0f}": round(float(np.percentile(weekly_pnls, lower_pct)), 2),
                 f"p{upper_pct:.0f}": round(float(np.percentile(weekly_pnls, upper_pct)), 2),
                 "prob_positive": round(float((weekly_pnls > 0).mean() * 100), 1),
-                "prob_above_target": round(
-                    float((weekly_pnls >= self.config.get("targets", {}).get("daily_profit_target", 5.0) * 5).mean() * 100), 1
-                ),
+                "prob_above_target": round(float((weekly_pnls >= target).mean() * 100), 1),
             },
         }
+
+    def _estimate_weeks_spanned(self, trades: list[dict]) -> int:
+        """Real calendar weeks spanned by the trade log, for a better
+        trades-per-week estimate than the old fixed n//5 heuristic."""
+        dates = pd.to_datetime([t["exit_date"] for t in trades])
+        span_days = (dates.max() - dates.min()).days
+        return max(1, round(span_days / 7))
 
     def _print_summary(self, metrics: dict):
         """Print formatted backtest summary."""
@@ -639,6 +745,9 @@ class Backtester:
             table.add_row("Win/Loss Ratio", str(metrics["avg_win_loss_ratio"]))
             table.add_row("Max Win Streak", str(metrics["max_win_streak"]))
             table.add_row("Max Loss Streak", str(metrics["max_loss_streak"]))
+            if "gfv_count_last_12mo" in metrics:
+                table.add_row("GFV Violations", f"{metrics['gfv_count_last_12mo']} / {metrics.get('gfv_limit', 3)}")
+                table.add_row("Unsettled Funded", str(metrics.get("trades_funded_by_unsettled_cash", 0)))
 
             console.print()
             console.print(table)

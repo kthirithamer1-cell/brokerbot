@@ -134,6 +134,15 @@ def train(ctx, symbols, years, period, timeframe, tune, tune_trials, source):
     sentiment_analyzer = SentimentAnalyzer()
     ml_model = MLModel(config_path)
 
+    # Fetch macro regime data once for all symbols
+    macro_df = None
+    try:
+        macro_df = data_loader.fetch_macro_context(period=train_period, interval=train_timeframe)
+        if not macro_df.empty:
+            logger.info(f"🌐 Macro context loaded: {len(macro_df)} bars (SPY, QQQ, IWM, VIX)")
+    except Exception as e:
+        logger.warning(f"Could not load macro context: {e}")
+
     # Collect data and features for all symbols
     all_features = []
     all_labels = []
@@ -162,8 +171,16 @@ def train(ctx, symbols, years, period, timeframe, tune, tune_trials, source):
         else:
             logger.info("  📰 Sentiment in training: DISABLED (prevents historical lookahead leak)")
 
-        # Engineer features (including new microstructure, regime, statistical)
-        features = feature_engine.compute_features(df, sentiment_features)
+        # Fetch full fundamental data
+        full_info = data_loader.fetch_full_info(symbol)
+
+        # Engineer features (including microstructure, macro regime, fundamental, statistical)
+        features = feature_engine.compute_features(
+            df,
+            sentiment_features=sentiment_features,
+            macro_df=macro_df,
+            fundamental_data=full_info,
+        )
         if features.empty:
             continue
 
@@ -361,8 +378,15 @@ def backtest(ctx, symbol, period, days, interval, capital, confidence, source):
     except Exception as e:
         logger.debug(f"Sentiment fetch in backtest skipped: {e}")
 
-    # Compute features
-    features = feature_engine.compute_features(df, sentiment_features=sentiment_features)
+    # Compute features (with macro and fundamental context)
+    macro_df = data_loader.fetch_macro_context(period=fetch_period, interval=interval)
+    full_info = data_loader.fetch_full_info(symbol)
+    features = feature_engine.compute_features(
+        df,
+        sentiment_features=sentiment_features,
+        macro_df=macro_df,
+        fundamental_data=full_info,
+    )
     if features.empty:
         logger.error("❌ Feature computation failed")
         return

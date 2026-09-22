@@ -1,0 +1,71 @@
+{
+  "total_trades": 4,
+  "winning_trades": 0,
+  "losing_trades": 4,
+  "win_rate_pct": 0.0,
+  "profit_factor": 0.0,
+  "total_return_pct": -63.73,
+  "total_pnl": -19.12,
+  "initial_capital": 30.0,
+  "final_equity": 10.88,
+  "max_drawdown_pct": -63.73,
+  "sharpe_ratio": -2.2,
+  "avg_win": 0,
+  "avg_loss": -4.78,
+  "avg_trade": -4.78,
+  "avg_win_loss_ratio": 0.0,
+  "max_win_streak": 0,
+  "max_loss_streak": 4,
+  "long_trades": 4,
+  "short_trades": 0,
+  "exit_reasons": {
+    "Stop-loss": 2,
+    "Sell signal": 2
+  },
+  "gfv_count_last_12mo": 0,
+  "gfv_limit": 3,
+  "trades_funded_by_unsettled_cash": 0,
+  "weekly_pnl": {
+    "weeks": [
+      {
+        "year": 2025,
+        "week": 44,
+        "pnl": -5.53,
+        "trades": 1,
+        "wins": 0,
+        "hit_target": false
+      },
+      {
+        "year": 2026,
+        "week": 10,
+        "pnl": -2.91,
+        "trades": 1,
+        "wins": 0,
+        "hit_target": false
+      },
+      {
+        "year": 2026,
+        "week": 11,
+        "pnl": -6.96,
+        "trades": 1,
+        "wins": 0,
+        "hit_target": false
+      },
+      {
+        "year": 2026,
+        "week": 35,
+        "pnl": -3.72,
+        "trades": 1,
+        "wins": 0,
+        "hit_target": false
+      }
+    ],
+    "total_weeks": 4,
+    "target_hit_count": 0,
+    "target_hit_rate": 0.0,
+    "weekly_target": 25.0,
+    "avg_weekly_pnl": -4.78,
+    "best_week": -2.91,
+    "worst_week": -6.96
+  }
+}

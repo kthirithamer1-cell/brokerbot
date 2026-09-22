@@ -1,0 +1,3 @@
+pair,direction,entry_price,exit_price,units,pnl_pips,pnl_usd,spread_cost,swap_cost,bars_held,reason,entry_date,exit_date
+EURUSD,SHORT,1.1558856451034545,1.14989,1000,60.0,5.75,0.15,0.1,49,TP,2026-09-14 18:00:00+01:00,2026-09-16 19:00:00+01:00
+EURUSD,SHORT,1.1481874668121337,1.14732,1000,8.7,0.72,0.15,0.0,49,End of backtest,2026-09-17 16:00:00+01:00,2026-09-21 18:00:00+01:00

@@ -1,0 +1,2 @@
+pair,direction,entry_price,exit_price,units,pnl_pips,pnl_usd,spread_cost,swap_cost,bars_held,reason,entry_date,exit_date
+GBPUSD,SHORT,1.336169549179077,1.33917,1000,-30.0,-3.15,0.15,0.0,12,SL,2026-09-18 06:00:00+01:00,2026-09-18 18:00:00+01:00

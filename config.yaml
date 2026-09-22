@@ -29,12 +29,16 @@ watchlist:
     - CLSK
     - SOFI
     - SNDL
+    - ORBS
+    - TNON
+    - GCTS
+    - GPRO
 
-# --- Penny Stock Scanner ---
+# --- Penny Stock Scanner: 5-Day Momentum Explosion ---
 penny_scanner:
   enabled: true
   min_price: 0.50
-  max_price: 10.00
+  max_price: 3.50               # Under $3.50 allows $30 budget to buy 10-30 shares
   min_avg_volume: 500000
   min_market_cap: 10_000_000    # $10M
   max_market_cap: 500_000_000   # $500M
@@ -42,27 +46,27 @@ penny_scanner:
     - NYSE
     - NASDAQ
     - AMEX
-  top_n_picks: 10
-  # Scoring weights (must sum to 1.0)
+  top_n_picks: 5
+  # Scoring weights optimized for 5-day momentum runs
   weights:
-    volume_surge: 0.25
-    momentum: 0.20
-    technical: 0.20
-    sentiment: 0.20
-    relative_strength: 0.15
+    volume_surge: 0.30          # Unusually high volume precedes major spikes
+    momentum: 0.25              # 5-day momentum and trend acceleration
+    technical: 0.20             # EMA cross, RSI breakout, MACD expansion
+    sentiment: 0.15             # Positive catalysts (FDA, earnings, partnerships)
+    relative_strength: 0.10     # Outperformance vs SPY
 
-# --- Strategy / ML: 15-Minute Fast Scalper ---
+# --- Strategy / ML: 5-Day Swing Runner ---
 strategy:
-  timeframe: "15m"             # 15-minute candles for maximum trade frequency
-  lookback_years: 1            # 1 year of training data
-  label_horizon_days: 1        # Look for moves within 1 trading day (~26 bars)
-  label_threshold_pct: 1.0     # Detect +1.0% intraday breakouts (was 2.5% — too high!)
-  label_mode: "atr_relative"   # "fixed" = old static threshold | "atr_relative" = dynamic ATR-based
-  label_atr_multiplier: 1.5    # Label BUY when forward return > 1.5 × ATR(14)
-  confidence_threshold: 0.42   # Calibrated to model's actual probability distribution (max ~0.52)
+  timeframe: "1d"              # Daily candles for swing momentum (eliminates intraday noise & commission drag)
+  lookback_years: 2            # 2 years of daily training data
+  label_horizon_days: 5        # 5-day forward return target
+  label_threshold_pct: 15.0    # Target +15% to +40% swing runs
+  label_mode: "atr_relative"   # ATR-based dynamic volatility threshold
+  label_atr_multiplier: 1.2    # Require forward return > 1.2 × ATR(14)
+  confidence_threshold: 0.40   # Calibrated confidence gate
   model_type: "xgboost"
-  retrain_interval_days: 7     # Retrain weekly for fast-moving penny stocks
-  use_sentiment_in_training: false # Prevent lookahead leak: don't broadcast recent news backward across historical bars
+  retrain_interval_days: 7     # Weekly refresh
+  use_sentiment_in_training: false
 
 # --- Model Ensemble Configuration ---
 model:
@@ -116,9 +120,11 @@ risk:
   max_position_pct: 35.0       # 35% max per position (cash account: leaves room for settlement rotation)
   max_daily_loss_pct: 8.0      # Daily drawdown kill-switch
   max_open_positions: 3        # Focus on top 3 setups
-  stop_loss_atr_mult: 2.0      # Wider 2.0x ATR stop-loss — give penny stocks more room (was 1.5)
-  take_profit_atr_mult: 3.0    # Wider 3.0x ATR profit target — let winners run (was 2.5)
-  trailing_stop_pct: 1.5       # Trail 1.5% below high watermark (lock profits fast)
+  stop_loss_atr_mult: 3.0      # Increased from 2.0: wider stop-loss gives trades more room to breathe
+  take_profit_atr_mult: 4.5    # Increased from 3.0: maintains 1:1.5 risk/reward ratio
+  trailing_stop_pct: 2.0       # Trail 2.0% below high watermark
+  enable_breakeven_stop: false # Disabled: do not prematurely ratchet stop-loss to breakeven
+  breakeven_atr_mult: 1.5
   # Cash account settlement rules
   settlement_days: 1           # T+1 settlement for US stocks (since May 2024)
   max_day_trades_per_5d: 3     # Max round-trip day trades per 5 business days (safety limit)

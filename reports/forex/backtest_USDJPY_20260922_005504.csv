@@ -1,0 +1,2 @@
+pair,direction,entry_price,exit_price,units,pnl_pips,pnl_usd,spread_cost,swap_cost,bars_held,reason,entry_date,exit_date
+USDJPY,LONG,156.94900024414062,157.355,3000,40.6,7.98,0.31,0,19,End of backtest,2026-09-21 04:00:00+01:00,2026-09-21 23:00:00+01:00

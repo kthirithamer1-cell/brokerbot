@@ -1,0 +1,293 @@
+# ============================================
+# Forex AI Trading Bot — Configuration
+# ============================================
+# TARGET: +$50-100/week on $500 capital (H1 scalping/swing with leverage)
+
+# --- Data Sources ---
+data:
+  price_source: "yfinance"       # "yfinance" | "oanda" — yfinance supports forex via EURUSD=X tickers
+  history_years: 2               # How many years of history to download
+  cache_expiry_hours: 1          # Re-download every 1 hour for fast-moving 15m candles
+
+# --- IBKR Connection ---
+ibkr:
+  host: "127.0.0.1"
+  port: 7497          # 7497 = TWS Paper, 7496 = TWS Live, 4002 = Gateway Paper, 4001 = Gateway Live
+  client_id: 2        # Different client ID from stock bot to avoid conflicts
+  account: ""         # Leave empty to auto-detect
+  contract_type: "CASH"  # Forex uses CASH contract type in IBKR
+
+# --- MT5 / XM Connection ---
+mt5:
+  terminal_path: ""              # Path to MT5 terminal (leave empty for auto-detect)
+  login: 0                       # MT5 account number (0 = use currently logged-in account)
+  password: ""                   # MT5 password (leave empty to use saved credentials)
+  server: ""                     # MT5 server name (e.g., "XMGlobal-MT5", leave empty for auto)
+  timeout: 10000                 # Connection timeout in ms
+  symbol_suffix: ""              # Some brokers add suffix to symbols (e.g., ".a", "m")
+  lot_type: "micro"              # "standard" (1.0) | "mini" (0.1) | "micro" (0.01)
+  magic_number: 234567           # Unique magic number to identify bot orders
+  deviation: 20                  # Max price deviation in points for market orders
+  fill_policy: "ioc"             # "ioc" (Immediate or Cancel) | "fok" (Fill or Kill)
+
+# --- Forex Pair Watchlist ---
+watchlist:
+  # Active trading pairs (Majors with high liquidity across Sydney, Tokyo, London, NY)
+  active_pairs:
+    - USDCAD
+    - EURUSD
+    - AUDUSD
+    - USDJPY
+    - GBPUSD
+    - USDCHF
+    - NZDUSD
+
+  # Major pairs reference
+  majors:
+    - EURUSD
+    - USDCAD
+    - AUDUSD
+    - USDJPY
+    - USDCHF
+    - GBPUSD
+    - NZDUSD
+  # Minor/cross pairs reference
+  crosses:
+    - EURGBP
+    - EURJPY
+    - EURCHF
+    - EURAUD
+    - EURCAD
+    - GBPJPY
+    - GBPCHF
+    - GBPAUD
+    - GBPCAD
+    - AUDJPY
+    - AUDCAD
+    - AUDNZD
+    - NZDJPY
+    - NZDCAD
+    - CADJPY
+    - CHFJPY
+
+# --- Pair Selector (replaces penny_scanner) ---
+pair_selector:
+  enabled: true
+  min_adr_pips: 40              # Minimum Average Daily Range in pips (skip dead pairs)
+  max_spread_pips: 3.0           # Maximum spread to accept a trade
+  min_avg_volume_ticks: 1000     # Minimum average tick volume
+  top_n_pairs: 5                 # Number of top pairs to trade per cycle
+  weights:
+    momentum: 0.30               # Price momentum score
+    volatility: 0.25             # ATR/ADR breakout potential
+    technical: 0.20              # RSI/MACD/EMA alignment
+    session_alignment: 0.15      # Is this pair active in current session?
+    currency_strength: 0.10      # Divergence between base and quote currency strength
+
+# --- Strategy / ML ---
+strategy:
+  timeframe: "1h"                # H1 bars — avoids spread drag and 15m noise wicks
+  lookback_years: 2.0            # 2 years of H1 data
+  label_horizon_bars: 12         # 12 H1 bars forward = 12 hours forward horizon
+  label_threshold_pips: 30       # Dynamic ATR-relative threshold for H1 moves
+  label_mode: "atr_relative"     # ATR-based dynamic threshold
+  label_atr_multiplier: 1.0      # Require forward return > 1.0 × ATR(14)
+  confidence_threshold: 0.40     # 40% threshold for hybrid confirmation
+  model_type: "xgboost"
+  retrain_interval_days: 7       # Weekly refresh
+  use_sentiment_in_training: false
+  # Pip value configuration
+  pip_value:
+    standard_lot: 100000         # 1 standard lot = 100,000 units
+    mini_lot: 10000              # 1 mini lot = 10,000 units
+    micro_lot: 1000              # 1 micro lot = 1,000 units
+    default_lot_type: "micro"    # Start with micro lots for $500 capital
+
+# --- Hybrid Strategy Engine ---
+hybrid:
+  enabled: true                  # Enable classical rules + ML validation
+  strategies:
+    - "h1_trend"                 # H1 Trend-Following (EMA 50/200 + ADX + Donchian)
+    - "london_breakout"          # London Open Asian Range Breakout (07:00-11:00 UTC)
+  min_adx: 22.0                  # Minimum ADX required for trend trades
+  require_ml_confirmation: true  # ML ensemble must agree with rule direction
+  require_currency_strength: true# Currency strength must not contradict direction
+  min_strength_divergence: 0.002 # Solution 4: Require minimum 0.002 strength divergence
+
+# --- Model Ensemble Configuration ---
+model:
+  ensemble_method: "stacking"    # "single" | "voting" | "stacking"
+  base_models:
+    - "xgboost"
+    - "lightgbm"
+    - "catboost"
+  feature_selection: true
+  max_features: 35               # Slightly more features for forex (sessions, currency strength)
+  feature_selection_mode: "global"
+  purge_gap_bars: 48             # Gap >= 2× label horizon (24 bars) to prevent leakage
+  embargo_bars: 12               # Embargo after test set
+  use_sample_weights: true
+  use_smote: false
+  min_probability_gap: 0.02      # 2% probability lead over runner-up (calibrated for 3-class)
+  confidence_percentile: null
+
+# --- Regime Detection & Trend Filters ---
+regime:
+  enabled: true
+  volatility_lookback: 50
+  trend_strength_min_adx: 25     # Require ADX >= 25 (strict trend requirement; avoids flat consolidations)
+  trend_filter_ema: 200          # Only LONG if Close > EMA200, only SHORT if Close < EMA200
+  high_vol_threshold: 75
+  low_vol_threshold: 25
+
+# --- Leverage & Margin ---
+leverage:
+  max_leverage: 1000             # 1000:1 leverage (XM Micro / Standard account)
+  margin_requirement_pct: 0.1    # 0.1% margin requirement per position (1/1000)
+  margin_call_level: 100         # Margin call at 100% margin level
+  stop_out_level: 50             # Force-close at 50% margin level
+
+# --- Daily Targets ---
+targets:
+  daily_profit_target_pips: 50   # Daily profit target in total pips
+  daily_profit_target_usd: 20.0  # Daily profit target in USD
+  scale_down_at_pct: 60
+  stop_trading_at_pct: 120
+
+# --- Model Monitoring ---
+monitoring:
+  enabled: true
+  rolling_accuracy_window: 100   # Larger window for H1 bars (more data points)
+  decay_threshold_pct: 10
+  auto_retrain: true
+  feature_drift_threshold: 2.0
+
+# --- Trading Sessions (UTC) ---
+sessions:
+  tokyo:
+    start: "00:00"
+    end: "09:00"
+    active_pairs: ["USDJPY", "AUDJPY", "NZDJPY", "EURJPY", "GBPJPY", "AUDUSD", "NZDUSD"]
+    size_multiplier: 0.8         # Slightly reduced size (lower liquidity except JPY pairs)
+  london:
+    start: "07:00"
+    end: "16:00"
+    active_pairs: ["EURUSD", "GBPUSD", "EURGBP", "USDCHF", "EURJPY", "GBPJPY"]
+    size_multiplier: 1.0         # Full size (highest liquidity)
+  new_york:
+    start: "12:00"
+    end: "21:00"
+    active_pairs: ["EURUSD", "GBPUSD", "USDCAD", "USDJPY", "USDCHF"]
+    size_multiplier: 1.0         # Full size
+  london_ny_overlap:
+    start: "12:00"
+    end: "16:00"
+    size_multiplier: 1.2         # Boost during overlap (peak liquidity + volatility)
+  weekend_shutdown:
+    close_all_before: "Friday 20:30 UTC"  # Close positions before weekend gap
+    reopen_after: "Sunday 21:30 UTC"
+
+# --- Risk Management ---
+risk:
+  fixed_lots: 0.02               # Solution 2: Default 0.02 micro lots ($0.20/pip for $40 account)
+  enable_compounding: true        # Solution 2: Auto-scale: $40-75 -> 0.02, $75-110 -> 0.03, $110+ -> 0.04
+  max_stop_loss_pips: 35.0       # Solution 3: Hard ceiling of 35 pips (max $6-7 risk per trade)
+  max_risk_per_trade_pct: 1.0    # Fallback risk percentage if fixed_lots is disabled
+  max_position_pct: 50.0         # Allow micro lot sizing on $40 account
+  max_daily_loss_pct: 3.0        # Daily drawdown kill-switch at 3%
+  allow_weekend_trading: false   # If true, disables weekend restrictions (Sunday >= 21:00 UTC is open by default)
+  max_open_positions: 3          # Max 3 simultaneous positions (one per Golden Trio pair)
+  stop_loss_atr_mult: 2.0        # 2.0 × ATR allows trades to breathe
+  take_profit_atr_mult: 3.6      # 3.6 × ATR target preserves strong 1.8:1 Risk-to-Reward
+  min_stop_loss_pips: 30.0       # Minimum stop floor
+  min_take_profit_pips: 60.0     # Minimum target floor for multi-hour trend continuation
+  trailing_stop_pct: 0.8         # Trail 0.8% below high watermark
+  enable_breakeven_stop: false   # Disable premature breakeven exits that cut winners short
+  breakeven_atr_mult: 2.0        # Move to breakeven only after +2.0 ATR profit if enabled
+  cooldown_bars: 8               # Cooldown period (8 bars = 2 hours on M15) after an SL hit
+  rsi_max_buy: 65.0              # Don't buy overbought exhaustion (require RSI <= 65)
+  rsi_min_sell: 35.0             # Don't sell oversold exhaustion (require RSI >= 35)
+  # Spread filter
+  max_entry_spread_pips: 4.5     # Accept XM standard spreads up to 4.5 pips (60 pip TP easily absorbs it)
+  # Swap/rollover awareness
+  consider_swap_cost: true       # Factor in overnight swap in trade decisions
+  max_negative_swap_pips: -2.0   # Skip if negative swap exceeds this per day
+  # Correlation-based exposure
+  max_correlation: 0.75          # Max correlation between open positions
+  max_same_currency_exposure: 3  # Max 3 positions involving the same currency
+  # Regime-aware stops
+  regime_stops:
+    trending:
+      stop_loss_atr_mult: 1.8
+      take_profit_atr_mult: 3.8  # Let trends run
+    ranging:
+      stop_loss_atr_mult: 2.2
+      take_profit_atr_mult: 2.2  # Balanced targets in ranges
+    volatile:
+      stop_loss_atr_mult: 2.5
+      take_profit_atr_mult: 3.0
+  # Time-based stop
+  time_stop_bars: 48             # Close if no significant move in 48 H1 bars (2 days)
+  time_stop_min_move_pct: 0.15   # Minimum move to keep position open
+
+# --- Sentiment / News ---
+sentiment:
+  provider: "newsapi"
+  model: "ProsusAI/finbert"
+  lookback_days: 3               # Shorter lookback for faster-moving forex news
+  min_articles: 2
+  # Forex-specific news search terms
+  forex_keywords:
+    - "federal reserve"
+    - "ECB"
+    - "bank of england"
+    - "bank of japan"
+    - "RBA"
+    - "RBNZ"
+    - "interest rate"
+    - "inflation"
+    - "employment"
+    - "GDP"
+    - "trade balance"
+
+# --- Backtesting ---
+backtest:
+  initial_capital: 40.0          # Starting capital in USD ($40 micro account)
+  spread_pips: 1.5               # Average spread simulation (1.5 pips for majors)
+  slippage_pips: 0.5             # Slippage simulation
+  swap_per_day_pips: -0.5        # Average daily swap cost simulation
+  enable_shorts: true            # Forex is symmetric — always allow both directions
+  leverage: 1000                 # Backtest leverage (1000:1)
+  monte_carlo_iterations: 1000
+  monte_carlo_confidence: 0.95
+  # Pip values for P&L conversion (per standard lot, approximate)
+  pip_values:
+    EURUSD: 10.0
+    GBPUSD: 10.0
+    USDJPY: 6.8
+    USDCHF: 10.6
+    AUDUSD: 10.0
+    NZDUSD: 10.0
+    USDCAD: 7.5
+    default: 10.0
+
+# --- Logging ---
+logging:
+  level: "INFO"
+  trade_log_file: "logs/forex_trades.csv"
+  report_dir: "reports/forex/"
+
+# --- Pip Definitions ---
+# Most pairs: 1 pip = 0.0001 (4th decimal)
+# JPY pairs:  1 pip = 0.01 (2nd decimal)
+pip_definitions:
+  default_decimals: 4
+  jpy_pairs_decimals: 2
+  jpy_pairs:
+    - USDJPY
+    - EURJPY
+    - GBPJPY
+    - AUDJPY
+    - NZDJPY
+    - CADJPY
+    - CHFJPY

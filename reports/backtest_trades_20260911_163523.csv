@@ -1,0 +1,4 @@
+entry_date,exit_date,type,entry_price,exit_price,shares,stop_loss,take_profit,pnl,pnl_pct,exit_reason,commission,funded_by_unsettled
+2025-07-17 00:00:00-04:00,2025-07-21 00:00:00-04:00,long,19.98,18.7724,1,18.7818,21.7773,-3.21,-6.04,Stop-loss,2.0,False
+2025-07-22 00:00:00-04:00,2025-08-01 00:00:00-04:00,long,19.8899,15.4623,1,15.9064,25.8653,-6.43,-22.26,Stop-loss (gap),2.0,False
+2026-06-04 00:00:00-04:00,2026-07-02 00:00:00-04:00,long,13.8869,12.7743,1,12.780714648110525,18.0816,-3.11,-8.01,Stop-loss,2.0,False

@@ -1,0 +1,4 @@
+entry_date,exit_date,type,entry_price,exit_price,shares,stop_loss,take_profit,pnl,pnl_pct,exit_reason,commission,funded_by_unsettled
+2026-08-17 12:00:00-04:00,2026-08-17 13:30:00-04:00,long,1.2406,1.2395,10,1.2207285932132177,1.2914,-2.01,-0.09,Sell signal,2.0,False
+2026-08-17 14:30:00-04:00,2026-08-19 09:30:00-04:00,long,1.2356,1.2294,9,1.234685787132808,1.2787,-2.06,-0.5,Stop-loss (gap),2.0,False
+2026-09-03 10:45:00-04:00,2026-09-04 12:15:00-04:00,long,1.3823,1.4465,8,1.4124786002295358,1.4472,-1.49,4.64,Take-profit,2.0,False

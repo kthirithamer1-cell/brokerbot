@@ -7,9 +7,23 @@ ML confidence overlay.
 """
 
 import logging
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# Setup UTF-8 safe streams on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
 
 import numpy as np
 import pandas as pd
@@ -94,9 +108,9 @@ class PennyScanner:
 
     def _get_candidates(self) -> pd.DataFrame:
         """Filter the universe for valid penny stock candidates."""
-        min_price = self.scanner_cfg.get("min_price", 0.50)
+        min_price = self.scanner_cfg.get("min_price", 0.1)
         max_price = self.scanner_cfg.get("max_price", 5.00)
-        min_volume = self.scanner_cfg.get("min_avg_volume", 500_000)
+        min_volume = self.scanner_cfg.get("min_avg_volume", 100_000)
         min_mcap = self.scanner_cfg.get("min_market_cap", 10_000_000)
         max_mcap = self.scanner_cfg.get("max_market_cap", 500_000_000)
 
@@ -111,7 +125,7 @@ class PennyScanner:
         for symbol in symbols:
             try:
                 info = self.data_loader.fetch_stock_info(symbol)
-                if not info:
+                if not info or not info.get("is_valid", True):
                     continue
 
                 price = info.get("price", 0)
@@ -155,10 +169,13 @@ class PennyScanner:
                 spy_data["Close"].iloc[-1] / spy_data["Close"].iloc[-5] - 1
             ) * 100
 
+        # Fetch macro context once for ML model feature engineering (1y for 200 SMA indicator warm-up)
+        macro_df = self.data_loader.fetch_macro_context(period="1y", interval="1d")
+
         for _, row in candidates.iterrows():
             symbol = row["symbol"]
             try:
-                score = self._score_single(symbol, row, spy_return_5d, ml_model)
+                score = self._score_single(symbol, row, spy_return_5d, ml_model, macro_df=macro_df)
                 if score:
                     scores.append(score)
             except Exception as e:
@@ -172,12 +189,12 @@ class PennyScanner:
         return df
 
     def _score_single(
-        self, symbol: str, info: dict, spy_return_5d: float, ml_model=None
+        self, symbol: str, info: dict, spy_return_5d: float, ml_model=None, macro_df=None
     ) -> dict | None:
-        """Score a single penny stock candidate."""
+        """Score a single penny stock candidate for 5-day momentum setups."""
 
-        # Fetch 3 months of daily data
-        df = self.data_loader.fetch_price_data(symbol, period="3mo", interval="1d")
+        # Fetch 1 year of daily data (requires >=200 bars for SMA 200 / ATR / MACD warm-up)
+        df = self.data_loader.fetch_price_data(symbol, period="1y", interval="1d")
         if df.empty or len(df) < 20:
             return None
 
@@ -199,13 +216,26 @@ class PennyScanner:
         # ── 3. TECHNICAL SETUP SCORE (0–100) ──
         tech_score = self._compute_technical_score(df)
 
-        # ── 4. SENTIMENT SCORE (0–100) ──
-        sent_score = self._compute_sentiment_score(symbol)
+        # ── 4. SENTIMENT & CATALYST SCORE (0–100) ──
+        sent_score, catalyst_flags, articles = self._compute_sentiment_and_catalysts(symbol)
 
         # ── 5. RELATIVE STRENGTH SCORE (0–100) ──
         stock_ret_5d = ret_5d
         rs = stock_ret_5d - spy_return_5d
         rs_score = min(100, max(0, 50 + rs * 5))
+
+        # ── 6. FUNDAMENTAL / SHORT SQUEEZE SCORE ──
+        full_info = self.data_loader.fetch_full_info(symbol)
+        float_shares = full_info.get("float_shares") or 0.0
+        short_pct = full_info.get("short_pct_float") or 0.0
+
+        # Penalize dilution/offering heavily (major penny stock risk)
+        if catalyst_flags.get("catalyst_dilution") or catalyst_flags.get("catalyst_offering"):
+            sent_score = max(0.0, sent_score - 30.0)
+
+        # Boost if low float and short interest
+        if 0 < float_shares < 15_000_000 and short_pct > 0.15:
+            vol_score = min(100.0, vol_score + 10.0)
 
         # ── WEIGHTED TOTAL ──
         total = (
@@ -220,21 +250,35 @@ class PennyScanner:
         ml_confidence = 0.0
         if ml_model is not None:
             try:
-                features = self.feature_engine.compute_features(df)
+                features = self.feature_engine.compute_features(
+                    df,
+                    macro_df=macro_df,
+                    quote_info=info,
+                    fundamental_data=full_info,
+                    news_articles=articles,
+                )
                 if not features.empty:
-                    pred = ml_model.predict(features.iloc[[-1]])
+                    pred_features = features.drop(columns=["Close"], errors="ignore")
+                    pred = ml_model.predict(pred_features.iloc[[-1]])
                     ml_confidence = pred["prob_buy"].iloc[0]
             except Exception as e:
                 logger.debug(f"ML prediction failed for {symbol}: {e}")
 
         # Determine key catalyst
-        catalyst = self._determine_catalyst(vol_ratio, ret_5d, tech_score, sent_score)
+        catalyst = self._determine_catalyst(vol_ratio, ret_5d, tech_score, sent_score, catalyst_flags)
+
+        price_val = round(info.get("price", close.iloc[-1]), 2)
+        shares_30 = int(30.0 / price_val) if price_val > 0 else 0
+        stop_loss = round(close.iloc[-1] * 0.92, 2)           # -8% risk stop
+        target_25 = round(close.iloc[-1] * 1.25, 2)           # +25% 5-day base target
+        target_40 = round(close.iloc[-1] * 1.40, 2)           # +40% 5-day runner target
+        est_profit_30 = round(shares_30 * (target_25 - price_val), 2)
 
         return {
             "symbol": symbol,
             "name": info.get("name", symbol),
-            "price": round(info.get("price", close.iloc[-1]), 2),
-            "sector": info.get("sector", "Unknown"),
+            "price": price_val,
+            "sector": full_info.get("sector") or info.get("sector", "Unknown"),
             "volume_surge_score": round(vol_score, 1),
             "momentum_score": round(momentum_score, 1),
             "technical_score": round(tech_score, 1),
@@ -243,11 +287,16 @@ class PennyScanner:
             "total_score": round(total, 1),
             "ml_confidence": round(ml_confidence, 3),
             "volume_ratio": round(vol_ratio, 2),
+            "rel_volume": info.get("rel_volume", round(vol_ratio, 2)),
+            "spread_pct": info.get("spread_pct"),
             "return_5d_pct": round(ret_5d, 2),
             "return_10d_pct": round(ret_10d, 2),
             "key_catalyst": catalyst,
-            "suggested_stop_loss": round(close.iloc[-1] * 0.92, 2),  # 8% below
-            "suggested_target": round(close.iloc[-1] * 1.15, 2),    # 15% above
+            "suggested_stop_loss": stop_loss,
+            "suggested_target": target_25,
+            "extended_target": target_40,
+            "shares_on_30": shares_30,
+            "est_profit_30": est_profit_30,
         }
 
     def _compute_technical_score(self, df: pd.DataFrame) -> float:
@@ -284,6 +333,12 @@ class PennyScanner:
             if close.iloc[-1] > ema_9:
                 score += 5   # Price above short EMA
 
+            # Resistance breakout (20-day high breakout like ORBS / TNON)
+            if len(df) >= 21:
+                high_20 = df["High"].iloc[-21:-1].max()
+                if close.iloc[-1] >= high_20:
+                    score += 15  # Fresh 20-day breakout!
+
             # Bollinger Band position
             bb = ta_lib.volatility.BollingerBands(close)
             bb_pct = bb.bollinger_pband().iloc[-1]
@@ -297,14 +352,21 @@ class PennyScanner:
 
         return min(100, max(0, score))
 
-    def _compute_sentiment_score(self, symbol: str) -> float:
-        """Compute sentiment score (0–100) from news using fast financial lexicon (low RAM)."""
-        if not self.data_loader.news_api_key:
-            return 50.0  # Instant neutral score without slow network scraping
+    def _compute_sentiment_and_catalysts(self, symbol: str) -> tuple[float, dict, list]:
+        """Compute sentiment score (0–100) and detect catalyst flags from news."""
         try:
             articles = self.data_loader.fetch_news(symbol, days_back=3)
             if not articles:
-                return 50.0  # Neutral if no news
+                return 50.0, {}, []
+
+            catalyst_flags = {}
+            from sentiment import SentimentAnalyzer
+            combined_texts = " ".join(
+                (str(a.get("title", "")) + " " + str(a.get("description", ""))).lower()
+                for a in articles
+            )
+            for cat_name, pattern in SentimentAnalyzer.CATALYST_PATTERNS.items():
+                catalyst_flags[cat_name] = 1 if bool(re.search(pattern, combined_texts, re.IGNORECASE)) else 0
 
             bullish_words = {
                 "surge", "gain", "soar", "jump", "rally", "profit", "beat", "growth",
@@ -324,20 +386,37 @@ class PennyScanner:
 
             total = pos_count + neg_count
             if total == 0:
-                return 50.0
+                return 50.0, catalyst_flags, articles
 
             net = (pos_count - neg_count) / total
-            return float(min(100.0, max(0.0, 50.0 + net * 50.0)))
+            score = float(min(100.0, max(0.0, 50.0 + net * 50.0)))
+            return score, catalyst_flags, articles
 
         except Exception as e:
             logger.debug(f"Sentiment scoring failed for {symbol}: {e}")
-            return 50.0
+            return 50.0, {}, []
 
     def _determine_catalyst(
-        self, vol_ratio: float, ret_5d: float, tech_score: float, sent_score: float
+        self,
+        vol_ratio: float,
+        ret_5d: float,
+        tech_score: float,
+        sent_score: float,
+        catalyst_flags: Optional[dict] = None,
     ) -> str:
         """Determine the primary catalyst for the pick."""
         catalysts = []
+        flags = catalyst_flags or {}
+
+        # High-priority fundamental catalyst flags
+        if flags.get("catalyst_dilution"):
+            catalysts.append("⚠️ Dilution Alert")
+        if flags.get("catalyst_fda"):
+            catalysts.append("💊 FDA Catalyst")
+        if flags.get("catalyst_earnings"):
+            catalysts.append("📊 Earnings")
+        if flags.get("catalyst_merger"):
+            catalysts.append("🤝 M&A")
 
         if vol_ratio > 3:
             catalysts.append("Volume surge")
@@ -354,10 +433,8 @@ class PennyScanner:
         elif tech_score > 60:
             catalysts.append("Technical breakout")
 
-        if sent_score > 70:
+        if sent_score > 70 and not flags.get("catalyst_fda") and not flags.get("catalyst_earnings"):
             catalysts.append("Positive news")
-        elif sent_score < 30:
-            catalysts.append("Contrarian (neg. sentiment)")
 
         if not catalysts:
             catalysts.append("Multi-factor")
@@ -375,22 +452,25 @@ class PennyScanner:
             today = datetime.now().strftime("%b %d, %Y")
 
             table = Table(
-                title=f"PENNY STOCK PICKS — {today}",
+                title=f"🚀 5-DAY PENNY STOCK MOMENTUM SCANNER — {today}",
                 show_header=True,
                 header_style="bold magenta",
                 border_style="bright_blue",
             )
 
-            table.add_column("Rank", style="bold", justify="center", width=5)
-            table.add_column("Ticker", style="bold cyan", width=7)
-            table.add_column("Price", justify="right", width=7)
-            table.add_column("Score", justify="center", width=7)
+            table.add_column("Rank", style="bold", justify="center", width=4)
+            table.add_column("Ticker", style="bold cyan", width=6)
+            table.add_column("Price", justify="right", width=6)
+            table.add_column("Score", justify="center", width=5)
             table.add_column("ML Conf.", justify="center", width=8)
-            table.add_column("Vol Ratio", justify="center", width=9)
             table.add_column("5d Ret%", justify="right", width=8)
-            table.add_column("Catalyst", width=22)
-            table.add_column("Stop-Loss", justify="right", width=9)
-            table.add_column("Target", justify="right", width=9)
+            table.add_column("Vol", justify="center", width=5)
+            table.add_column("Catalyst", width=20)
+            table.add_column("Stop (-8%)", justify="right", width=8)
+            table.add_column("5d Target (+25%)", justify="right", width=12)
+            table.add_column("Runner (+40%)", justify="right", width=10)
+            table.add_column("Shares ($30)", justify="center", width=9)
+            table.add_column("Est Gain", justify="right", style="bold green", width=9)
 
             for _, row in picks.iterrows():
                 score_color = (
@@ -398,7 +478,10 @@ class PennyScanner:
                     else "yellow" if row["total_score"] >= 50
                     else "red"
                 )
-                ml_pct = f"{row['ml_confidence']*100:.0f}%" if row["ml_confidence"] > 0 else "N/A"
+                ml_pct = f"{row['ml_confidence']*100:.0f}%" if row.get("ml_confidence", 0) > 0 else "N/A"
+                shares = row.get("shares_on_30", 0)
+                est_p = row.get("est_profit_30", 0.0)
+                est_str = f"+${est_p:.2f}" if est_p > 0 else "$0.00"
 
                 table.add_row(
                     str(row["rank"]),
@@ -406,33 +489,43 @@ class PennyScanner:
                     f"${row['price']:.2f}",
                     f"[{score_color}]{row['total_score']:.0f}[/{score_color}]",
                     ml_pct,
-                    f"{row['volume_ratio']:.1f}x",
                     f"{row['return_5d_pct']:+.1f}%",
+                    f"{row['volume_ratio']:.1f}x",
                     row["key_catalyst"],
                     f"${row['suggested_stop_loss']:.2f}",
                     f"${row['suggested_target']:.2f}",
+                    f"${row.get('extended_target', row['suggested_target']):.2f}",
+                    str(shares),
+                    est_str,
                 )
 
             console.print()
             console.print(table)
             console.print()
             console.print(Panel(
-                "[yellow]Penny stocks are HIGH RISK. Use strict stop-losses and "
-                "never risk more than 1-2% of your account per trade.[/yellow]",
-                border_style="yellow",
+                "[bold cyan]🎯 $30 ➔ $60 GROWTH BLUEPRINT (Volume Breakouts):[/bold cyan]\n"
+                "• [bold]Strategy:[/bold] Enter high-RVOL volume breakouts (like ORBS / TNON) targeting +20% to +30%.\n"
+                "• [bold]Golden Exit Rule:[/bold] Take profit immediately when target is reached. Do NOT hold blindly for 5 days (e.g. ORBS surged +26% on Day 1 then faded!).\n"
+                "• [bold]Cash Account Rule:[/bold] Hold until target hit (1 to 4 days) -> cash settles under T+1 -> rotate 100% into next runner.\n"
+                "• [bold]Fee Advantage:[/bold] IBKR Tiered is only ~$0.35/order ($0.70 round-trip). 3–4 trades = ~$2.50 fees total.\n"
+                "• [bold]Risk Rule:[/bold] Cut losses immediately at -8% stop loss ($2.40 max loss on $30 capital). Never hold a failing breakout.",
+                border_style="green",
             ))
 
-        except Exception:
+        except Exception as e:
             # Fallback without rich
+            logger.warning(f"Rich console table render error: {e}")
             print(f"\n{'='*70}")
-            print(f"  PENNY STOCK PICKS — {datetime.now().strftime('%b %d, %Y')}")
+            print(f"  5-DAY PENNY STOCK PICKS -- {datetime.now().strftime('%b %d, %Y')}")
             print(f"{'='*70}")
             for _, row in picks.iterrows():
+                cat = str(row.get("key_catalyst", "")).encode("ascii", errors="replace").decode("ascii")
                 print(
                     f"  #{row['rank']} {row['symbol']:>6} | "
                     f"${row['price']:.2f} | "
                     f"Score: {row['total_score']:.0f} | "
-                    f"{row['key_catalyst']}"
+                    f"5d Target: ${row.get('suggested_target', 0):.2f} (+25%) | "
+                    f"{cat}"
                 )
             print(f"{'='*70}\n")
 

@@ -1,6 +1,6 @@
 {
   "overall_status": "HEALTHY \u2014 Model performing well",
-  "generated_at": "2026-09-09T22:51:06.214479",
+  "generated_at": "2026-09-10T23:53:47.467457",
   "total_predictions": 5,
   "rolling_accuracy": {
     "status": "ok",
@@ -14,11 +14,7 @@
     "avg_sell_pnl": 0
   },
   "model_decay": {
-    "status": "healthy",
-    "live_accuracy": 1.0,
-    "training_accuracy": 0.55,
-    "decay_pct": -81.82,
-    "threshold_pct": 10,
+    "status": "no_training_baseline",
     "needs_retrain": false
   },
   "signal_quality": {

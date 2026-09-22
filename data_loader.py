@@ -6,9 +6,16 @@ yfinance (fallback / fundamentals / news), or IBKR (live trading).
 """
 
 import os
+import re
+import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
+import requests
 from typing import Optional
 
 import pandas as pd
@@ -19,6 +26,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+CACHE_TTL_SECONDS = 900  # 15 minutes
 
 
 class DataLoader:
@@ -323,83 +332,490 @@ class DataLoader:
     #  STOCK SCREENING DATA (for penny scanner)
     # ──────────────────────────────────────────────
 
-    def fetch_stock_info(self, symbol: str) -> dict:
-        """Fetch basic stock info (price, volume, market cap, exchange) ultra-fast via fast_info."""
-        if symbol in self._info_cache:
+    def fetch_stock_info(self, symbol: str, use_cache: bool = True) -> dict:
+        """
+        Fetch stock info via fast_info — fast, but only fast_info fields
+        (no sector/industry/float; use fetch_full_info() for those on a
+        shortlist). Includes relative volume and spread, which fast/basic
+        scanners typically miss.
+        """
+        self._ensure_cache_attrs()
+
+        if use_cache and symbol in self._info_cache and self._cache_valid(symbol):
             return self._info_cache[symbol]
+
+        for attempt in range(2):
+            try:
+                ticker = yf.Ticker(symbol)
+                fi = ticker.fast_info
+
+                price = float(getattr(fi, "last_price", 0.0) or getattr(fi, "previous_close", 0.0) or 0.0)
+                prev_close = float(getattr(fi, "previous_close", 0.0) or 0.0)
+                avg_vol = float(
+                    getattr(fi, "three_month_average_volume", 0)
+                    or getattr(fi, "ten_day_average_volume", 0)
+                    or 0
+                )
+                last_vol = float(getattr(fi, "last_volume", 0) or getattr(fi, "regular_market_volume", 0) or 0)
+                mcap = float(getattr(fi, "market_cap", 0) or 0)
+                bid = float(getattr(fi, "bid", 0) or 0)
+                ask = float(getattr(fi, "ask", 0) or 0)
+                day_high = float(getattr(fi, "day_high", 0) or 0)
+                day_low = float(getattr(fi, "day_low", 0) or 0)
+                year_high = float(getattr(fi, "year_high", 0) or 0)
+                year_low = float(getattr(fi, "year_low", 0) or 0)
+                shares_out = float(getattr(fi, "shares", 0) or 0)
+                exchange = getattr(fi, "exchange", "") or ""
+
+                if price <= 0:
+                    # Halted, delisted, or bad ticker — don't cache garbage as if it were real
+                    logger.debug(f"{symbol}: no valid price from fast_info")
+                    return {"symbol": symbol, "is_valid": False, "error": "no_price"}
+
+                # --- Relative volume: THE key penny-stock momentum signal ---
+                rel_volume = round(last_vol / avg_vol, 2) if avg_vol > 0 else 0.0
+
+                # --- Spread %: liquidity/execution-risk check ---
+                spread_pct = round(((ask - bid) / ask) * 100, 2) if (bid > 0 and ask > 0) else None
+
+                # --- % change vs previous close ---
+                change_pct = round(((price - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0.0
+
+                # --- Position within day/52w range (0 = at low, 1 = at high) ---
+                day_range_pos = (
+                    round((price - day_low) / (day_high - day_low), 2)
+                    if day_high > day_low else None
+                )
+                year_range_pos = (
+                    round((price - year_low) / (year_high - year_low), 2)
+                    if year_high > year_low else None
+                )
+
+                info = {
+                    "symbol": symbol,
+                    "is_valid": True,
+                    "price": price,
+                    "prev_close": prev_close,
+                    "change_pct": change_pct,
+                    "avg_volume": avg_vol,
+                    "last_volume": last_vol,
+                    "rel_volume": rel_volume,          # >1 = trading above average (trending)
+                    "market_cap": mcap,
+                    "shares_outstanding": shares_out,
+                    "bid": bid,
+                    "ask": ask,
+                    "spread_pct": spread_pct,           # None if no quote; watch for >3-5% = illiquid
+                    "day_high": day_high,
+                    "day_low": day_low,
+                    "day_range_pos": day_range_pos,
+                    "year_high": year_high,
+                    "year_low": year_low,
+                    "year_range_pos": year_range_pos,
+                    "exchange": exchange,
+                    # Placeholder tier — real values only via fetch_full_info()
+                    "sector": None,
+                    "industry": None,
+                    "name": symbol,
+                    "info_tier": "fast",
+                }
+                self._cache_set(symbol, info)
+                return info
+
+            except Exception as e:
+                logger.debug(f"fetch_stock_info({symbol}) attempt {attempt + 1}/2 failed: {e}")
+                time.sleep(0.5)
+
+        return {"symbol": symbol, "is_valid": False, "error": "fetch_failed"}
+
+    def fetch_stock_info_batch(
+        self, symbols: list[str], max_workers: int = 8, use_cache: bool = True
+    ) -> dict[str, dict]:
+        """
+        Parallel version of fetch_stock_info for scanning a full universe.
+        Bounded thread pool avoids hammering Yahoo hard enough to trigger 429s,
+        while still being far faster than the sequential single-symbol loop
+        you'd get calling fetch_stock_info() in a plain for-loop.
+        """
+        results: dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self.fetch_stock_info, sym, use_cache): sym
+                for sym in symbols
+            }
+            for future in as_completed(futures):
+                sym = futures[future]
+                try:
+                    results[sym] = future.result()
+                except Exception as e:
+                    logger.warning(f"Batch fetch failed for {sym}: {e}")
+                    results[sym] = {"symbol": sym, "is_valid": False, "error": str(e)}
+
+        valid_count = sum(1 for r in results.values() if r.get("is_valid"))
+        logger.info(f"Batch fetched {valid_count}/{len(symbols)} valid quotes")
+        return results
+
+    def fetch_full_info(self, symbol: str, use_cache: bool = True) -> dict:
+        """
+        Slow, accurate tier — real sector/industry/float/PE/beta from yfinance's
+        full .info endpoint. Call this ONLY on your final shortlist after
+        fast_info-based filtering, not on the whole universe — .info is
+        meaningfully slower and heavier per-symbol than fast_info.
+        """
+        self._ensure_cache_attrs()
+        cache_key = f"{symbol}:full"
+
+        if use_cache and cache_key in self._info_cache and self._cache_valid(cache_key):
+            return self._info_cache[cache_key]
+
         try:
             ticker = yf.Ticker(symbol)
-            fi = ticker.fast_info
-            price = float(getattr(fi, "last_price", 0.0) or getattr(fi, "previous_close", 0.0) or 0.0)
-            avg_vol = float(getattr(fi, "three_month_average_volume", 0) or getattr(fi, "ten_day_average_volume", 0) or 0)
-            mcap = float(getattr(fi, "market_cap", 0) or 0)
+            raw = ticker.info or {}
+
             info = {
                 "symbol": symbol,
-                "price": price,
-                "avg_volume": avg_vol,
-                "market_cap": mcap,
-                "exchange": getattr(fi, "exchange", ""),
-                "sector": "Trending Small-Cap",
-                "industry": "Momentum",
-                "name": symbol,
+                "is_valid": bool(raw.get("regularMarketPrice") or raw.get("currentPrice")),
+                "name": raw.get("shortName") or raw.get("longName") or symbol,
+                "sector": raw.get("sector"),
+                "industry": raw.get("industry"),
+                "float_shares": raw.get("floatShares"),
+                "shares_outstanding": raw.get("sharesOutstanding"),
+                "short_ratio": raw.get("shortRatio"),
+                "short_pct_float": raw.get("shortPercentOfFloat"),
+                "pe_ratio": raw.get("trailingPE"),
+                "forward_pe": raw.get("forwardPE"),
+                "beta": raw.get("beta"),
+                "insider_pct": raw.get("heldPercentInsiders"),
+                "institution_pct": raw.get("heldPercentInstitutions"),
+                "target_mean_price": raw.get("targetMeanPrice"),
+                "recommendation": raw.get("recommendationKey"),
+                "info_tier": "full",
             }
-            self._info_cache[symbol] = info
+            self._cache_set(cache_key, info)
             return info
         except Exception as e:
-            logger.debug(f"Failed to fetch fast_info for {symbol}: {e}")
-            return {}
+            logger.warning(f"fetch_full_info({symbol}) failed: {e}")
+            return {"symbol": symbol, "is_valid": False, "error": str(e), "info_tier": "full"}
 
-    def get_penny_stock_universe(self, max_price: float = 10.0, min_price: float = 0.50, min_volume: int = 500_000) -> list[str]:
+    def fetch_macro_context(
+        self, period: str = "2y", interval: str = "1d", use_cache: bool = True
+    ) -> pd.DataFrame:
         """
-        Get a broad list of penny stock tickers to screen, including live trending and active stocks.
-        Queries live Yahoo Finance screeners (day_gainers, most_actives) and merges with curated universe.
+        Fetch broader market regime context (SPY, QQQ, IWM, VIX).
+        Provides macro trend, growth appetite, small-cap relative strength (IWM),
+        and market-wide volatility/risk sentiment.
         """
+        cache_key = f"macro:{period}:{interval}"
+        if use_cache and hasattr(self, "_macro_cache") and cache_key in self._macro_cache:
+            ts = getattr(self, "_macro_cache_ts", {}).get(cache_key, 0)
+            if time.time() - ts < 3600:  # 1 hour cache for macro
+                return self._macro_cache[cache_key].copy()
+
+        symbols = ["SPY", "QQQ", "IWM", "^VIX"]
+        dfs = {}
+        for sym in symbols:
+            try:
+                df = self.fetch_price_data(sym, period=period, interval=interval, use_cache=use_cache)
+                if not df.empty and "Close" in df.columns:
+                    s = df["Close"].copy()
+                    if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
+                        s.index = s.index.tz_convert(None)
+                    dfs[sym] = s
+            except Exception as e:
+                logger.warning(f"Failed to fetch macro data for {sym}: {e}")
+
+        if not dfs:
+            return pd.DataFrame()
+
+        macro_df = pd.DataFrame(dfs)
+        if isinstance(macro_df.index, pd.DatetimeIndex) and macro_df.index.tz is not None:
+            macro_df.index = macro_df.index.tz_convert(None)
+
+        # Forward/backward fill individual symbol series first because NYSE (SPY/QQQ/IWM at :30)
+        # and CBOE (^VIX at :00) trade on staggered hourly timestamps. Without ffill, pct_change
+        # evaluates across interleaved NaNs and returns 100% NaN for returns!
+        macro_df = macro_df.ffill().bfill()
+
+        result = pd.DataFrame(index=macro_df.index)
+        if "SPY" in macro_df.columns:
+            result["spy_close"] = macro_df["SPY"]
+            result["spy_return_1d"] = macro_df["SPY"].pct_change(1).fillna(0.0)
+            result["spy_return_5d"] = macro_df["SPY"].pct_change(5).fillna(0.0)
+        if "QQQ" in macro_df.columns:
+            result["qqq_close"] = macro_df["QQQ"]
+            result["qqq_return_1d"] = macro_df["QQQ"].pct_change(1).fillna(0.0)
+            result["qqq_return_5d"] = macro_df["QQQ"].pct_change(5).fillna(0.0)
+        if "IWM" in macro_df.columns:
+            result["iwm_close"] = macro_df["IWM"]
+            result["iwm_return_1d"] = macro_df["IWM"].pct_change(1).fillna(0.0)
+            result["iwm_return_5d"] = macro_df["IWM"].pct_change(5).fillna(0.0)
+        if "^VIX" in macro_df.columns:
+            result["vix_level"] = macro_df["^VIX"]
+            result["vix_change_5d"] = macro_df["^VIX"].pct_change(5).fillna(0.0)
+
+        result.ffill(inplace=True)
+        result.bfill(inplace=True)
+
+        if not hasattr(self, "_macro_cache"):
+            self._macro_cache = {}
+            self._macro_cache_ts = {}
+        self._macro_cache[cache_key] = result
+        self._macro_cache_ts[cache_key] = time.time()
+
+        return result.copy()
+
+    def fetch_earnings_dates(self, symbol: str) -> dict:
+        """Fetch days until next earnings date and days since last earnings date."""
+        try:
+            ticker = yf.Ticker(symbol)
+            cal = ticker.calendar
+            now = datetime.now()
+            next_date = None
+            if isinstance(cal, dict):
+                dates = cal.get("Earnings Date") or cal.get("Earnings High")
+                if dates and isinstance(dates, list) and len(dates) > 0:
+                    next_date = pd.to_datetime(dates[0]).to_pydatetime().replace(tzinfo=None)
+            elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                if "Earnings Date" in cal.index:
+                    val = cal.loc["Earnings Date"].iloc[0]
+                    next_date = pd.to_datetime(val).to_pydatetime().replace(tzinfo=None)
+
+            if next_date:
+                days_until = max(0, (next_date - now).days)
+                return {"days_until_earnings": days_until, "next_earnings_date": str(next_date)}
+        except Exception as e:
+            logger.debug(f"Earnings lookup failed for {symbol}: {e}")
+
+        return {"days_until_earnings": 999, "next_earnings_date": None}
+
+    CACHE_TTL_SECONDS = 900  # 15 minutes
+
+    def _ensure_cache_attrs(self):
+        if not hasattr(self, "_info_cache"):
+            self._info_cache = {}
+        if not hasattr(self, "_cache_ts"):
+            self._cache_ts = {}
+
+    def _cache_set(self, key: str, data: dict) -> None:
+        self._ensure_cache_attrs()
+        self._info_cache[key] = data
+        self._cache_ts[key] = time.time()
+
+    def _cache_valid(self, key: str) -> bool:
+        self._ensure_cache_attrs()
+        ts = self._cache_ts.get(key)
+        return ts is not None and (time.time() - ts) < CACHE_TTL_SECONDS
+
+    def _get_yahoo_session(self):
+        """
+        Fixed version: your original called .text on the crumb response but
+        never checked the status code, and never set a real browser UA on the
+        crumb request. If Yahoo returns a 401/HTML error page here, `crumb`
+        silently becomes garbage and every screener call after it 401s.
+        """
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        })
+        try:
+            session.get("https://fc.yahoo.com", timeout=5)  # sets cookies
+            crumb_resp = session.get(
+                "https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=5
+            )
+            crumb = crumb_resp.text.strip()
+            if crumb_resp.status_code != 200 or not crumb or "<html" in crumb.lower():
+                logger.warning(f"Yahoo crumb request failed (status {crumb_resp.status_code})")
+                return session, None
+            return session, crumb
+        except Exception as e:
+            logger.warning(f"Yahoo session/crumb setup failed: {e}")
+            return session, None
+
+    def _fetch_yahoo_screener(self, session, crumb, scr_id, min_price, max_price, min_volume, count=100):
+        """Fetch one Yahoo predefined screener with retry/backoff. Returns raw quote dicts."""
+        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+        params = {
+            "formatted": "false",
+            "lang": "en-US",
+            "region": "US",
+            "scrIds": scr_id,
+            "count": count,
+        }
+        if crumb:
+            params["crumb"] = crumb
+
+        for attempt in range(3):
+            try:
+                resp = session.get(url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    result = data.get("finance", {}).get("result") or [{}]
+                    return result[0].get("quotes", [])
+                if resp.status_code == 401:
+                    logger.warning(f"{scr_id}: 401 Unauthorized (crumb invalid/expired) — not retrying")
+                    return []
+                logger.warning(f"{scr_id}: HTTP {resp.status_code} (attempt {attempt + 1}/3)")
+            except Exception as e:
+                logger.warning(f"{scr_id}: request error {e} (attempt {attempt + 1}/3)")
+            time.sleep(2 ** attempt)
+        return []
+
+    def _fetch_nasdaq_universe(self) -> list[str]:
+        """Pull the full current NASDAQ + NYSE/AMEX ticker list (free, no auth)."""
+        symbols = set()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        urls = [
+            "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+            "https://nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+        ]
+        for url in urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=15)
+                resp.raise_for_status()
+                lines = resp.text.splitlines()
+                header = lines[0].split("|")
+                sym_idx = header.index("Symbol") if "Symbol" in header else 0
+                for line in lines[1:-1]:  # last line is a file-generation footer
+                    parts = line.split("|")
+                    if len(parts) <= sym_idx:
+                        continue
+                    sym = parts[sym_idx].strip()
+                    if sym and sym.isascii() and "$" not in sym and "." not in sym and len(sym) <= 5:
+                        symbols.add(sym)
+            except Exception as e:
+                logger.warning(f"Could not fetch {url}: {e}")
+        logger.info(f"Exchange sweep: {len(symbols)} raw symbols from NASDAQ/NYSE/AMEX")
+        return sorted(symbols)
+
+    def _batch_filter_by_price_volume(self, symbols, min_price, max_price, min_volume, batch_size=150) -> list[str]:
+        """Bulk-fetch last price/volume for a large symbol list and keep only penny-range hits."""
+        try:
+            import yfinance as yf
+        except ImportError:
+            logger.warning("yfinance not installed — skipping exchange-sweep price filter")
+            return []
+
+        matched = []
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            try:
+                data = yf.download(
+                    tickers=" ".join(batch),
+                    period="1d",
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                )
+            except Exception as e:
+                logger.warning(f"Batch {i // batch_size} quote fetch failed: {e}")
+                continue
+
+            for sym in batch:
+                try:
+                    row = data[sym] if len(batch) > 1 else data
+                    if row.empty:
+                        continue
+                    price = float(row["Close"].iloc[-1])
+                    vol = float(row["Volume"].iloc[-1])
+                    if min_price <= price <= max_price and vol >= min_volume:
+                        matched.append(sym)
+                        if not self._cache_valid(sym):
+                            self._cache_set(sym, {
+                                "symbol": sym,
+                                "name": sym,
+                                "price": price,
+                                "avg_volume": vol,
+                                "market_cap": 0,
+                                "pe_ratio": None,
+                                "beta": 1.5,
+                                "sector": "Unknown",
+                                "industry": "Unknown",
+                                "52w_high": price,
+                                "52w_low": price,
+                                "change_pct": 0,
+                            })
+                except Exception:
+                    continue
+        logger.info(f"Exchange sweep price/volume filter matched {len(matched)} symbols")
+        return matched
+
+    def get_penny_stock_universe(
+        self,
+        max_price: float = 10.0,
+        min_price: float = 0.50,
+        min_volume: int = 500_000,
+    ) -> list[str]:
+        """
+        Get a broad list of penny stock tickers to screen, including live trending
+        and active stocks. Queries live Yahoo Finance screeners (properly
+        authenticated with crumb/session), falls back to a full NASDAQ/NYSE/AMEX
+        exchange sweep if the live screeners under-deliver, and only falls back
+        to a small static safety net if BOTH live sources fail.
+        """
+        self._ensure_cache_attrs()
         logger.info("Discovering live trending and active penny stocks...")
         screener_symbols = set()
 
-        # Method 1: Live Yahoo Finance Predefined Screeners (Day Gainers & Most Active)
-        try:
-            import requests
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            for scr_id in ["day_gainers", "most_actives"]:
-                url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&lang=en-US&region=US&scrIds={scr_id}&count=100"
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    quotes = resp.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-                    for q in quotes:
-                        sym = q.get("symbol", "")
-                        price = q.get("regularMarketPrice", 0) or 0
-                        vol = q.get("regularMarketVolume", 0) or q.get("averageDailyVolume3Month", 0) or 0
-                        # Filter for penny/small-cap range and liquid volume
-                        if sym and min_price <= price <= max_price and vol >= min_volume:
-                            screener_symbols.add(sym)
-                            # Cache basic info directly to save network calls later
-                            self._info_cache[sym] = {
-                                "symbol": sym,
-                                "name": q.get("shortName", sym),
-                                "price": price,
-                                "avg_volume": vol,
-                                "market_cap": q.get("marketCap", 0) or 0,
-                                "pe_ratio": q.get("trailingPE"),
-                                "beta": 1.5,
-                                "sector": "Trending Small-Cap",
-                                "industry": "Trending",
-                                "52w_high": q.get("fiftyTwoWeekHigh", price),
-                                "52w_low": q.get("fiftyTwoWeekLow", price),
-                                "change_pct": q.get("regularMarketChangePercent", 0),
-                            }
-            logger.info(f"Discovered {len(screener_symbols)} live trending/active penny stocks from Yahoo Finance")
-        except Exception as e:
-            logger.warning(f"Could not fetch live trending screeners: {e}")
+        # Method 1: Live Yahoo Finance Predefined Screeners (properly authenticated)
+        session, crumb = self._get_yahoo_session()
+        if crumb is None:
+            logger.warning("Proceeding without a Yahoo crumb — screener calls will likely 401")
 
-        # If live screener returned few or no symbols, fallback to expanded list
-        if len(screener_symbols) < 10:
+        scr_ids = [
+            "day_gainers",
+            "most_actives",
+            "small_cap_gainers",
+            "undervalued_growth_stocks",
+            "growth_technology_stocks",
+            "aggressive_small_caps",
+        ]
+        for scr_id in scr_ids:
+            quotes = self._fetch_yahoo_screener(session, crumb, scr_id, min_price, max_price, min_volume)
+            for q in quotes:
+                sym = q.get("symbol", "")
+                price = q.get("regularMarketPrice", 0) or 0
+                vol = q.get("regularMarketVolume", 0) or q.get("averageDailyVolume3Month", 0) or 0
+                # Filter for penny/small-cap range and liquid volume
+                if sym and min_price <= price <= max_price and vol >= min_volume:
+                    screener_symbols.add(sym)
+                    # Cache basic info directly to save network calls later
+                    self._cache_set(sym, {
+                        "symbol": sym,
+                        "name": q.get("shortName", sym),
+                        "price": price,
+                        "avg_volume": vol,
+                        "market_cap": q.get("marketCap", 0) or 0,
+                        "pe_ratio": q.get("trailingPE"),
+                        "beta": q.get("beta", 1.5),
+                        "sector": "Trending Small-Cap",
+                        "industry": "Trending",
+                        "52w_high": q.get("fiftyTwoWeekHigh", price),
+                        "52w_low": q.get("fiftyTwoWeekLow", price),
+                        "change_pct": q.get("regularMarketChangePercent", 0),
+                    })
+        logger.info(f"Discovered {len(screener_symbols)} live trending/active penny stocks from Yahoo Finance")
+
+        # Method 2: Broad NASDAQ/NYSE/AMEX exchange sweep if screeners under-delivered (< 8)
+        if len(screener_symbols) < 8:
+            logger.info("Live screener yield low — sweeping full NASDAQ/NYSE/AMEX listings...")
+            full_universe = self._fetch_nasdaq_universe()
+            if full_universe:
+                swept = self._batch_filter_by_price_volume(full_universe, min_price, max_price, min_volume)
+                screener_symbols.update(swept)
+                logger.info(f"Exchange sweep added {len(swept)} more candidates")
+
+        # Method 3: Static safety net — last resort only, clearly logged (not silent)
+        if len(screener_symbols) < 5:
+            logger.warning(
+                "Both live screeners and exchange sweep failed/near-empty — "
+                "using static safety net (results may be stale)"
+            )
             expanded_pennies = [
                 "PDSB", "SNDL", "CLNE", "GEVO", "MVIS", "BLNK", "DNA", "TELL", "GSAT",
                 "BTBT", "BNGO", "WKHS", "BARK", "PSFE", "FCEL", "ZOM", "CTRM",
                 "SENS", "AEVA", "OUST", "CAN", "HUT", "BITF", "WULF",
-                "PLUG", "SOFI", "NIO", "LCID", "MARA", "RIOT", "OPEN", "CLOV",
-                "BB", "NOK", "QS", "LAZR", "ACHR", "JOBY", "RIVN", "GRAB"
             ]
             screener_symbols.update(expanded_pennies)
 
@@ -407,7 +823,7 @@ class DataLoader:
         watchlist = self.config.get("watchlist", {}).get("symbols", [])
         screener_symbols.update([s.upper() for s in watchlist])
 
-        # Also always include PDSB
+        # Always include PDSB
         screener_symbols.add("PDSB")
 
         logger.info(f"Total penny universe for scanning: {len(screener_symbols)} symbols")
@@ -417,32 +833,102 @@ class DataLoader:
     #  NEWS DATA
     # ──────────────────────────────────────────────
 
+
+    def _parse_any_date(self, value) -> Optional[datetime]:
+        """Best-effort parse of a date coming from any of the three sources."""
+        if not value:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value)
+            except Exception:
+                return None
+        if isinstance(value, str):
+            # NewsAPI: ISO 8601, e.g. 2026-09-10T14:23:00Z
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                pass
+            # RSS pubDate: RFC 2822, e.g. "Wed, 10 Sep 2026 14:23:00 GMT"
+            try:
+                return parsedate_to_datetime(value).replace(tzinfo=None)
+            except Exception:
+                pass
+        return None
+
+    def _within_lookback(self, published_at, days_back: int) -> bool:
+        """Return True if the article's date is within the lookback window, or
+        if the date couldn't be parsed at all (fail open rather than silently
+        dropping everything when a source's date format is unexpected)."""
+        dt = self._parse_any_date(published_at)
+        if dt is None:
+            return True
+        cutoff = datetime.now() - timedelta(days=days_back)
+        return dt >= cutoff
+
+    def _dedup_articles(self, articles: list[dict]) -> list[dict]:
+        """Collapse near-duplicate wire-service stories syndicated across outlets."""
+        seen = set()
+        deduped = []
+        for a in articles:
+            title = (a.get("title") or "").lower().strip()
+            # Normalize: strip punctuation/whitespace so minor title variants collapse
+            key = re.sub(r"[^a-z0-9 ]", "", title)
+            key = re.sub(r"\s+", " ", key)[:80]  # first 80 chars is enough to catch dupes
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(a)
+        return deduped
+
     def fetch_news(
         self,
         query: str,
         days_back: Optional[int] = None,
         max_articles: int = 50,
     ) -> list[dict]:
-        """
-        Fetch financial news articles via NewsAPI.
 
-        Args:
-            query: Search query (ticker symbol or company name)
-            days_back: How many days of news to fetch
-            max_articles: Maximum number of articles
+        """
+        Fetch financial news articles, merging every source available:
+        NewsAPI (if key set) + Google News RSS (always, free) + Yahoo scrape
+        (fallback if the others come up short). All sources are filtered to
+        the same days_back window and deduplicated before returning.
 
         Returns:
             List of dicts with keys: title, description, source, url, published_at
         """
-        if not self.news_api_key or self.news_api_key == "your_newsapi_key_here":
-            logger.warning("No NewsAPI key set — falling back to scraper")
-            return self._scrape_news_fallback(query, days_back)
-
         if days_back is None:
             days_back = self.config["sentiment"].get("lookback_days", 7)
 
-        from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        all_articles: list[dict] = []
 
+        # --- Source 1: NewsAPI (best relevance/coverage, but rate-limited) ---
+        if self.news_api_key and self.news_api_key != "your_newsapi_key_here":
+            all_articles.extend(self._fetch_newsapi(query, days_back, max_articles))
+        else:
+            logger.info("No NewsAPI key set — skipping NewsAPI source")
+
+        # --- Source 2: Google News RSS (free, keyless, no quota) ---
+        try:
+            all_articles.extend(self._fetch_google_news_rss(query, days_back, max_articles))
+        except Exception as e:
+            logger.warning(f"Google News RSS failed for '{query}': {e}")
+
+        # --- Source 3: Yahoo scrape (fallback if the above returned little) ---
+        if len(all_articles) < 5:
+            all_articles.extend(self._scrape_news_fallback(query, days_back))
+
+        # Enforce the lookback window uniformly (NewsAPI already filters via
+        # `from_date`, but RSS/Yahoo need it applied here) and dedup.
+        filtered = [a for a in all_articles if self._within_lookback(a.get("published_at"), days_back)]
+        deduped = self._dedup_articles(filtered)
+
+        logger.info(f"fetch_news('{query}'): {len(deduped)} unique articles after merge/dedup")
+        return deduped[:max_articles]
+
+
+    def _fetch_newsapi(self, query: str, days_back: int, max_articles: int) -> list[dict]:
+        """NewsAPI /v2/everything source."""
+        from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         try:
             import requests as req
 
@@ -455,10 +941,12 @@ class DataLoader:
                 "language": "en",
                 "apiKey": self.news_api_key,
             }
-
-            response = req.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
+            resp = req.get(url, params=params, timeout=15)
+            if resp.status_code == 429:
+                logger.warning("NewsAPI rate limit hit (429) — daily quota likely exhausted")
+                return []
+            resp.raise_for_status()
+            data = resp.json()
 
             articles = []
             for article in data.get("articles", []):
@@ -469,21 +957,61 @@ class DataLoader:
                     "url": article.get("url", ""),
                     "published_at": article.get("publishedAt", ""),
                 })
-
-            logger.info(f"Fetched {len(articles)} articles for '{query}'")
+            logger.info(f"NewsAPI: {len(articles)} articles for '{query}'")
             return articles
-
         except Exception as e:
             logger.error(f"NewsAPI error for '{query}': {e}")
-            return self._scrape_news_fallback(query, days_back)
+            return []
+
+
+    def _fetch_google_news_rss(self, query: str, days_back: int, max_articles: int) -> list[dict]:
+        """
+        Free, keyless news source via Google News RSS. No API key, no daily
+        quota — good coverage boost for thinly-covered small/penny-cap tickers
+        that NewsAPI's free tier often misses entirely.
+        """
+        import requests as req
+
+        search_term = f"{query} stock"
+        url = f"https://news.google.com/rss/search?q={quote_plus(search_term)}&hl=en-US&gl=US&ceid=US:en"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+        resp = req.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+
+        root = ET.fromstring(resp.content)
+        articles = []
+        for item in root.findall(".//item")[: max_articles]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source_el = item.find("source")
+            source = source_el.text.strip() if source_el is not None and source_el.text else "Google News"
+            description = (item.findtext("description") or title).strip()
+
+            if title:
+                articles.append({
+                    "title": title,
+                    "description": description,
+                    "source": source,
+                    "url": link,
+                    "published_at": pub_date,
+                })
+
+        logger.info(f"Google News RSS: {len(articles)} articles for '{query}'")
+        return articles
+
 
     def _scrape_news_fallback(
         self, query: str, days_back: Optional[int] = None
     ) -> list[dict]:
         """
         Fallback: scrape Yahoo Finance news for a ticker.
-        Used when NewsAPI key is not available.
+        Fixed: days_back is now actually applied — previously accepted but ignored.
         """
+        if days_back is None:
+            days_back = self.config["sentiment"].get("lookback_days", 7)
+
         try:
             ticker = yf.Ticker(query)
             news = ticker.news or []
@@ -495,9 +1023,15 @@ class DataLoader:
                 content = item.get("content") if isinstance(item.get("content"), dict) else item
                 title = item.get("title") or content.get("title", "")
                 description = item.get("description") or content.get("summary") or content.get("description") or title
-                publisher = item.get("publisher") or (content.get("provider", {}).get("displayName") if isinstance(content.get("provider"), dict) else "")
-                url = item.get("link") or (content.get("canonicalUrl", {}).get("url") if isinstance(content.get("canonicalUrl"), dict) else "")
-                
+                publisher = item.get("publisher") or (
+                    content.get("provider", {}).get("displayName")
+                    if isinstance(content.get("provider"), dict) else ""
+                )
+                url = item.get("link") or (
+                    content.get("canonicalUrl", {}).get("url")
+                    if isinstance(content.get("canonicalUrl"), dict) else ""
+                )
+
                 pub_time = item.get("providerPublishTime") or content.get("pubDate") or content.get("providerPublishTime")
                 published_at = ""
                 if pub_time:
@@ -509,6 +1043,10 @@ class DataLoader:
                     elif isinstance(pub_time, str):
                         published_at = pub_time
 
+                # Fix: actually apply the days_back filter (previously ignored)
+                if not self._within_lookback(published_at, days_back):
+                    continue
+
                 articles.append({
                     "title": title,
                     "description": description,
@@ -517,15 +1055,16 @@ class DataLoader:
                     "published_at": published_at,
                 })
 
-            logger.info(f"Scraped {len(articles)} articles for '{query}' (fallback)")
+            logger.info(f"Scraped {len(articles)} articles for '{query}' within {days_back}d (fallback)")
             return articles
 
         except Exception as e:
             logger.error(f"News scrape fallback failed for '{query}': {e}")
             return []
 
+
     def fetch_news_for_symbols(self, symbols: list[str]) -> dict[str, list[dict]]:
-        """Fetch news for multiple symbols."""
+        """Fetch news for multiple symbols (sequential — see note below for parallelizing)."""
         all_news = {}
         for symbol in symbols:
             articles = self.fetch_news(symbol)

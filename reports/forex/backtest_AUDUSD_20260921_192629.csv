@@ -1,0 +1,2 @@
+pair,direction,entry_price,exit_price,units,pnl_pips,pnl_usd,spread_cost,swap_cost,bars_held,reason,entry_date,exit_date
+AUDUSD,SHORT,0.7141847097396851,0.70818,1000,60.0,5.75,0.15,0.1,48,TP,2026-09-14 20:00:00+01:00,2026-09-16 20:00:00+01:00

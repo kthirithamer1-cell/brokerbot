@@ -1,0 +1,6 @@
+symbol,name,price,sector,volume_surge_score,momentum_score,technical_score,sentiment_score,relative_strength_score,total_score,ml_confidence,volume_ratio,rel_volume,spread_pct,return_5d_pct,return_10d_pct,key_catalyst,suggested_stop_loss,suggested_target,extended_target,shares_on_30,est_profit_30,rank
+ORBS,ORBS,1.04,Consumer Cyclical,18.9,100.0,65.0,66.7,100.0,63.7,0.0,0.57,0.6,,15.6,29.98,Strong momentum + Technical breakout,0.96,1.31,1.46,28,7.56,1
+GCTS,"GCT Semiconductor Holding, Inc.",2.0,Technology,21.2,100.0,60.0,50.0,100.0,60.8,0.0,0.64,,,14.11,8.59,Strong momentum,1.86,2.52,2.83,15,7.8,2
+GPRO,"GoPro, Inc.",1.36,Technology,4.8,100.0,70.0,71.4,0.0,51.2,0.0,0.15,,,-19.12,129.17,🤝 M&A + Technical breakout,1.27,1.72,1.92,22,7.92,3
+XRX,Xerox Holdings Corporation,3.36,Industrials,22.2,86.3,65.0,0.0,63.9,47.6,0.0,0.67,,,1.96,10.62,Technical breakout,3.11,4.23,4.74,8,6.96,4
+OPTU,"Optimum Communications, Inc.",1.04,Communication Services,11.3,57.4,70.0,50.0,54.1,44.6,0.0,0.34,,,0.0,2.94,Technical breakout,0.97,1.31,1.47,28,7.56,5

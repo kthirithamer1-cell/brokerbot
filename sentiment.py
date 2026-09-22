@@ -7,6 +7,7 @@ confidence scores.
 """
 
 import logging
+import re
 from typing import Optional
 
 import numpy as np
@@ -202,26 +203,44 @@ class SentimentAnalyzer:
 
         return enriched
 
+    CATALYST_PATTERNS = {
+        "catalyst_earnings": r"\b(earnings|quarterly|revenue|eps|guidance|financial results)\b",
+        "catalyst_fda": r"\b(fda|approval|clinical trial|phase [123]|orphan drug|fast track|nda|bla)\b",
+        "catalyst_merger": r"\b(merger|acquisition|buyout|takeover|definitive agreement|tender offer)\b",
+        "catalyst_offering": r"\b(offering|public offering|direct offering|underwritten|prospectus|shelf)\b",
+        "catalyst_dilution": r"\b(dilution|warrant|convertible note|registered direct|atm offering|reverse split)\b",
+    }
+
     def compute_aggregate_sentiment(
-        self, scored_articles: list[dict], days_windows: list[int] = [1, 3, 7]
+        self,
+        scored_articles: list[dict],
+        days_windows: list[int] = [1, 3, 7],
+        as_of_time: Optional[pd.Timestamp] = None,
     ) -> dict:
         """
-        Compute aggregate sentiment features from scored articles.
+        Compute aggregate sentiment and catalyst features from scored articles.
+        Enforces strict timestamp alignment (no lookahead leakage).
 
-        Returns dict with features like:
-            - avg_sentiment_1d, avg_sentiment_3d, avg_sentiment_7d
-            - news_count_1d, news_count_3d, news_count_7d
-            - max_positive_score, max_negative_score
-            - sentiment_momentum (3d vs 7d)
+        Args:
+            scored_articles: List of article dicts with sentiment scores and published_at
+            days_windows: Rolling lookback windows in days
+            as_of_time: Maximum allowable timestamp for articles (lookahead protection)
+
+        Returns:
+            Dict with sentiment scores, news volumes, recency, and catalyst binary flags.
         """
+        catalyst_defaults = {cat: 0 for cat in self.CATALYST_PATTERNS}
         if not scored_articles:
             features = {}
             for d in days_windows:
                 features[f"avg_sentiment_{d}d"] = 0.0
                 features[f"news_count_{d}d"] = 0
+            features["sentiment_score"] = 0.0
+            features["days_since_last_news"] = 30.0
             features["max_positive_score"] = 0.0
             features["max_negative_score"] = 0.0
             features["sentiment_momentum"] = 0.0
+            features.update(catalyst_defaults)
             return features
 
         df = pd.DataFrame(scored_articles)
@@ -229,16 +248,11 @@ class SentimentAnalyzer:
         # Convert published_at to datetime
         if "published_at" in df.columns:
             df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce")
-            # If all dates are NaT, fall back to current time so articles aren't discarded
-            if df["published_at"].isna().all():
-                df["published_at"] = pd.Timestamp.now(tz="UTC")
-            else:
-                df["published_at"] = df["published_at"].fillna(pd.Timestamp.now(tz="UTC"))
+            df["published_at"] = df["published_at"].fillna(pd.Timestamp.now(tz="UTC"))
         else:
-            # If no dates, treat all as recent
             df["published_at"] = pd.Timestamp.now(tz="UTC")
 
-        now = pd.Timestamp.now(tz="UTC")
+        # Normalize UTC timezone
         try:
             if df["published_at"].dt.tz is None:
                 df["published_at"] = df["published_at"].dt.tz_localize("UTC")
@@ -246,6 +260,35 @@ class SentimentAnalyzer:
                 df["published_at"] = df["published_at"].dt.tz_convert("UTC")
         except Exception:
             df["published_at"] = pd.Timestamp.now(tz="UTC")
+
+        if as_of_time is not None:
+            now = pd.to_datetime(as_of_time)
+            if now.tzinfo is None:
+                now = now.tz_localize("UTC")
+            else:
+                now = now.tz_convert("UTC")
+        else:
+            now = pd.Timestamp.now(tz="UTC")
+
+        # CRITICAL LEAKAGE FILTER: only articles published at or before now
+        df = df[df["published_at"] <= now]
+
+        if df.empty:
+            features = {}
+            for d in days_windows:
+                features[f"avg_sentiment_{d}d"] = 0.0
+                features[f"news_count_{d}d"] = 0
+            features["sentiment_score"] = 0.0
+            features["days_since_last_news"] = 30.0
+            features["max_positive_score"] = 0.0
+            features["max_negative_score"] = 0.0
+            features["sentiment_momentum"] = 0.0
+            features.update(catalyst_defaults)
+            return features
+
+        # Days since last news event
+        latest_pub = df["published_at"].max()
+        days_since = max(0.0, round((now - latest_pub).total_seconds() / 86400.0, 2))
 
         # Compute net sentiment: positive - negative
         if "sentiment_positive" in df.columns and "sentiment_negative" in df.columns:
@@ -272,6 +315,10 @@ class SentimentAnalyzer:
             features[f"news_count_{d}d"] = len(window_df)
             sentiment_by_window[d] = avg_sent
 
+        # Primary sentiment_score alias (3-day window)
+        features["sentiment_score"] = features.get("avg_sentiment_3d", 0.0)
+        features["days_since_last_news"] = days_since
+
         # Max scores (safe computation)
         pos_max = df["sentiment_positive"].max() if ("sentiment_positive" in df.columns and len(df) > 0) else 0.0
         neg_max = df["sentiment_negative"].max() if ("sentiment_negative" in df.columns and len(df) > 0) else 0.0
@@ -285,6 +332,17 @@ class SentimentAnalyzer:
             features["sentiment_momentum"] = round(float(momentum), 4) if pd.notna(momentum) else 0.0
         else:
             features["sentiment_momentum"] = 0.0
+
+        # Catalyst detection across all articles in window (up to 7 days)
+        recent_cutoff = now - pd.Timedelta(days=7)
+        recent_df = df[df["published_at"] >= recent_cutoff]
+        combined_texts = " ".join(
+            (recent_df.get("title", pd.Series(dtype=str)).fillna("") + " " +
+             recent_df.get("description", pd.Series(dtype=str)).fillna("")).str.lower()
+        )
+
+        for cat_name, pattern in self.CATALYST_PATTERNS.items():
+            features[cat_name] = 1 if bool(re.search(pattern, combined_texts, re.IGNORECASE)) else 0
 
         # Guarantee no NaN exists
         for k, v in features.items():
